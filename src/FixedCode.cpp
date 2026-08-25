@@ -539,7 +539,7 @@ bool FixedCodeController::beginLearn(uint8_t id, fixed_learn_btn btn) {
   json->addElem("button", btn == fixed_learn_btn::on ? "on" : "off");
   json->addElem("learning", true);
   json->addElem("success", false);
-  json->addElem("pulseCount", (uint16_t)0);
+  json->addElem("pulseCount", (uint32_t)0);
   json->endObject();
   sockEmit.endEmit();
   return true;
@@ -562,7 +562,7 @@ void FixedCodeController::endLearn(bool cancel) {
   json->addElem("learning", false);
   json->addElem("success", false);
   json->addElem("cancelled", cancel);
-  json->addElem("pulseCount", (uint16_t)0);
+  json->addElem("pulseCount", (uint32_t)0);
   json->endObject();
   sockEmit.endEmit();
 }
@@ -635,7 +635,7 @@ void FixedCodeController::onLearnComplete(const uint16_t *pulses, uint16_t count
   json->addElem("button", btn == fixed_learn_btn::on ? "on" : "off");
   json->addElem("learning", false);
   json->addElem("success", ok);
-  json->addElem("pulseCount", count);
+  json->addElem("pulseCount", (uint32_t)count);
   json->addElem("rssi", (int32_t)peakRssi);
   json->addElem("preview", preview);
   json->addElem("code", code);
@@ -652,7 +652,7 @@ void FixedCodeController::emitLearnProgress() {
   json->addElem("button", this->learnBtn == fixed_learn_btn::on ? "on" : "off");
   json->addElem("learning", true);
   json->addElem("success", false);
-  json->addElem("pulseCount", somfy.transceiver.fixedCodeLearnPulseCount());
+  json->addElem("pulseCount", (uint32_t)somfy.transceiver.fixedCodeLearnPulseCount());
   json->addElem("rssi", (int32_t)somfy.transceiver.fixedCodeLearnRssi());
   json->addElem("listening", true);
   json->endObject();

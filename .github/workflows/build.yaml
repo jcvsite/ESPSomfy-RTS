@@ -166,12 +166,6 @@ jobs:
         with:
           name: LittleFS
 
-      - name: Stage LittleFS for .espsomfy packer
-        if: matrix.env != 'esp32s3_8mb'
-        run: |
-          mkdir -p .pio/build/${{ matrix.env }}
-          cp SomfyController.littlefs.bin .pio/build/${{ matrix.env }}/SomfyController.littlefs.bin
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -182,6 +176,53 @@ jobs:
 
       - name: Build firmware
         run: pio run -e ${{ matrix.env }}
+
+      # pio run wipes a pre-staged LittleFS; restore after firmware and pack .espsomfy
+      - name: Pack .espsomfy (restore shared LittleFS)
+        if: matrix.env != 'esp32s3_8mb'
+        env:
+          BUILD: .pio/build/${{ matrix.env }}
+          FWNAME: ${{ matrix.fwname }}
+          PACK: ${{ matrix.pack }}
+        run: |
+          set -e
+          mkdir -p "$BUILD"
+          cp SomfyController.littlefs.bin "$BUILD/SomfyController.littlefs.bin"
+          if [ ! -f "$BUILD/$FWNAME" ]; then
+            cp "$BUILD/firmware.bin" "$BUILD/$FWNAME"
+          fi
+          python3 <<'PY'
+          import os, struct
+          build = os.environ["BUILD"]
+          fw_path = os.path.join(build, os.environ["FWNAME"])
+          fs_path = os.path.join(build, "SomfyController.littlefs.bin")
+          out_path = os.path.join(build, os.environ["PACK"])
+          chip = {
+              "SomfyController.esp32.espsomfy": 0,
+              "SomfyController.esp32wrover.espsomfy": 1,
+              "SomfyController.esp32c3.espsomfy": 2,
+              "SomfyController.esp32s2.espsomfy": 3,
+              "SomfyController.esp32s3_4mb.espsomfy": 4,
+              "SomfyController.esp32s3_8mb.espsomfy": 5,
+          }[os.environ["PACK"]]
+          with open(fw_path, "rb") as f: fw = f.read()
+          with open(fs_path, "rb") as f: fs = f.read()
+          header = bytearray(32)
+          header[0:8] = b"ESPSOMFY"
+          struct.pack_into("<HBBII", header, 8, 1, chip, 0x03, len(fw), len(fs))
+          ver = "v3.4.5"
+          for rel in ("data/appversion", "data-dev/appversion"):
+              if os.path.isfile(rel):
+                  raw = open(rel, encoding="utf-8").read().strip().splitlines()[0].strip()
+                  if raw:
+                      ver = raw if raw.lower().startswith("v") else f"v{raw}"
+                      break
+          vb = ver.encode("ascii", "ignore")[:12]
+          header[20:20+len(vb)] = vb
+          with open(out_path, "wb") as f:
+              f.write(header); f.write(fw); f.write(fs)
+          print(f"packed {out_path} ({os.path.getsize(out_path)} bytes) ver={ver}")
+          PY
 
       - name: Build LittleFS (8MB partition)
         if: matrix.env == 'esp32s3_8mb'
