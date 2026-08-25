@@ -21,6 +21,14 @@ Web UI: **English** in this release (multi-language locale packs can be added la
 
 ![ESPSomfy-RTS features vs the original](images/espsomfy-features-vs-original.png)
 
+### Web UI (v3.4.5)
+
+Home (shades / rooms / scenes), Settings hub, and Mesh → Repeaters (fleet status and update):
+
+| Home | Settings | Mesh repeaters |
+|---|---|---|
+| ![Home](images/ui-home-shades.png) | ![Settings](images/ui-settings-hub.png) | ![Mesh](images/ui-mesh-repeaters.png) |
+
 **Repository:** [github.com/jcvsite/ESPSomfy-RTS](https://github.com/jcvsite/ESPSomfy-RTS)
 
 ## Why this fork
