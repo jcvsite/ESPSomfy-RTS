@@ -131,8 +131,8 @@ void FixedCodeSwitch::toJSON(JsonResponse &json) {
   json.addElem("state", this->state);
   json.addElem("singleButton", this->singleButton);
   json.addElem("flipCommands", this->flipCommands);
-  json.addElem("onCount", this->onCount);
-  json.addElem("offCount", this->offCount);
+  json.addElem("onCount", (uint32_t)this->onCount);
+  json.addElem("offCount", (uint32_t)this->offCount);
   json.addElem("hasOn", this->hasOn());
   json.addElem("hasOff", this->hasOff());
   json.addElem("ready", this->ready());
@@ -167,8 +167,8 @@ void FixedCodeSwitch::emitState(uint8_t num) {
   json->addElem("state", this->state);
   json->addElem("singleButton", this->singleButton);
   json->addElem("flipCommands", this->flipCommands);
-  json->addElem("onCount", this->onCount);
-  json->addElem("offCount", this->offCount);
+  json->addElem("onCount", (uint32_t)this->onCount);
+  json->addElem("offCount", (uint32_t)this->offCount);
   json->addElem("hasOn", this->hasOn());
   json->addElem("hasOff", this->hasOff());
   json->addElem("ready", this->ready());
