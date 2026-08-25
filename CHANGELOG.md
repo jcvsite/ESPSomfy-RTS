@@ -48,8 +48,7 @@ Initial public release of this fork (**firmware / Web UI 3.4.5**, board `esp32de
 - Firmware page lists CC1101 and library versions; Manual Update GitHub tab visible on desktop Settings.
 
 ### Release assets
-- Versioned GitHub release names are primary (e.g. `SomfyController.onboard.esp32-v3.4.5.bin.zip`, `…-v3.4.5.espsomfy`, `…-v3.4.5.bin`). Legacy unversioned aliases may still be uploaded for older controllers of this fork.
-- GitHub OTA prefers the versioned asset and falls back to the legacy name if needed.
+- GitHub release assets are **versioned only** (e.g. `SomfyController.onboard.esp32-v3.4.5.bin.zip`, `…-v3.4.5.espsomfy`, `…-v3.4.5.bin`). No unversioned/legacy aliases — incompatible with market firmwares and not used by this fork’s OTA.
 
 ### Alexa (optional, no Home Assistant)
 - Router can emulate a Philips Hue bridge for Alexa. Configure under **Network → Alexa** (master toggle + shade list, max 24). Lights: on/off + brightness → open/close + position. Prefer HA Cloud Alexa when using Home Assistant.

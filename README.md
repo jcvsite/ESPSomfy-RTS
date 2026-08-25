@@ -123,9 +123,9 @@ python -m platformio run -e esp32dev-cc1101v257
 python -m platformio run -t buildfs -e esp32dev-cc1101v257
 ```
 
-Legacy: `SomfyController.ino.esp32.bin` (firmware) and `SomfyController.littlefs.bin` (application). Prefer the web updater for the application part — USB `uploadfs` wipes LittleFS (shades). Download **Backup** first if you must flash the filesystem over USB.
+Prefer the web updater for the application part — USB `uploadfs` wipes LittleFS (shades). Download **Backup** first if you must flash the filesystem over USB.
 
-GitHub releases publish **versioned** assets as the primary names (e.g. `SomfyController.onboard.esp32-v3.4.5.bin.zip`, `…-v3.4.5.espsomfy`, `…-v3.4.5.bin`). Legacy unversioned aliases may still be uploaded for older controllers **of this fork**.
+GitHub releases publish **versioned** assets only (e.g. `SomfyController.onboard.esp32-v3.4.5.bin.zip`, `…-v3.4.5.espsomfy`, `…-v3.4.5.bin`). Unversioned/market-style names are not published — this fork is not compatible with those firmwares.
 
 Flash both Router and Repeaters with the same `.espsomfy` when mesh behavior changes.
 
