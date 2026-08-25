@@ -1642,6 +1642,11 @@ class UIBinder {
         });
     }
     goHome() {
+        // Repeaters have no shades/rooms — Home would be blank. Keep them in Settings.
+        if (document.documentElement.getAttribute('data-mesh-role') === 'repeater') {
+            this.goSettings();
+            return;
+        }
         this.setHomePanel();
         syncNavigationState('divHomePnl');
     }
