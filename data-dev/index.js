@@ -1,7 +1,5 @@
-//var hst = '192.168.4.1';
-var hst = '192.168.1.13';
-//var hst = '192.168.1.49';
-//var hst = '192.168.2.232';
+// Local file:// debug only — SoftAP default. Leave blank host unused when served from the device.
+var hst = '192.168.4.1';
 
 var _rooms = [];
 let LANG = {};
@@ -12,6 +10,10 @@ const get = id => document.getElementById(id);
 
 const closeOverlay = (div, callback) => {
     if (!div) return;
+    if (typeof firmware !== 'undefined' && firmware.isUpdateBusy && firmware.isUpdateBusy()) {
+        // Block accidental dismiss while FW/FS flash is in progress.
+        if (div.id === 'divUploadFile' || div.id === 'divGitInstall') return;
+    }
     if (typeof callback === 'function') callback();
     div.classList.add('overlay-exit');
     setTimeout(() => div.remove(), 300);
@@ -22,6 +24,7 @@ if (typeof ui !== 'undefined' && ui.waitMessage) {
 window.tr = function(id) {
     return (LANG && LANG[id]) ? LANG[id] : id;
 };
+const REBOOT_WAIT_FALLBACK = 'Rebooting… please wait';
 const translator = {
     isInitialized: false,
     observer: null,
@@ -56,27 +59,61 @@ const translator = {
     }
 };
 function loadLang(callback) {
-    if (Object.keys(LANG).length > 0) {
-        console.log("Langue déjà en mémoire, utilisation du cache.");
+    if (Object.keys(LANG).length > 2) {
         if (callback) callback();
         return;
     }
-    fetch(baseUrl + '/lang')
-    .then(r => r.json())
-    .then(dict => {
-        LANG = dict;
+    const applyDict = (dict) => {
+        LANG = dict && typeof dict === 'object' ? dict : {};
         translator.init();
         finishLoad(callback);
+    };
+    fetch(baseUrl + '/lang?_=' + Date.now())
+    .then(r => {
+        if (!r.ok) throw new Error('lang HTTP ' + r.status);
+        return r.json();
+    })
+    .then(dict => {
+        if (!dict || !dict.WELCOME) throw new Error('lang missing keys');
+        applyDict(dict);
     })
     .catch(err => {
-        console.error("Erreur langue, mode secours activé", err);
-        LANG = { "BT_LOGIN": "Login", "HOME": "Maison" };
-        translator.init();
-        finishLoad(callback);
+        console.error("Language load failed", err);
+        // Minimal fallback so the UI is usable until LittleFS is re-flashed
+        applyDict({
+            BT_LOGIN: "Login",
+            HOME: "Home",
+            WELCOME: "Finish setup",
+            WELCOME_EMPTY_TITLE: "No motors yet",
+            WELCOME_DESC: "Connect network and radio, then restore a backup or add a shade.",
+            WELCOME_DESC_READY: "Restore a backup after a failed update, or add a new shade.",
+            WELCOME_NET_DESC: "Connect to Wi-Fi or Ethernet",
+            WELCOME_NET_DONE: "Connected",
+            WELCOME_RAD_DESC: "Match the radio to your motors (usually 433.42 MHz)",
+            WELCOME_RAD_DONE: "Radio configured",
+            WELCOME_SYS_DESC: "Theme, login, and firmware updates",
+            WELCOME_MOTORS_TITLE: "Motors",
+            WELCOME_MOTORS_DESC: "No shades yet — restore a backup or add a new device.",
+            WELCOME_ADD_SHADE_TITLE: "Add a device",
+            WELCOME_ADD_SHADE_DESC: "Pair a shade, blind, gate, or garage",
+            WELCOME_FOOTER_NOTE: "Hides after you add a room, device, or group.",
+            TAB_NETWORK: "Network",
+            TAB_RADIO: "Radio",
+            TAB_SYSTEM: "System",
+            MSG_REBOOTING: REBOOT_WAIT_FALLBACK,
+            MSG_RECONNECTING: "Reconnecting… please wait",
+            PROMPT_REBOOT_CONFIRM: "Are you sure you want to reboot the device?",
+            BT_YES: "Yes",
+            BT_NO: "No",
+            BT_OK: "OK",
+            BT_CLOSE: "Close"
+        });
     });
 }
 function finishLoad(callback) {
     document.body.classList.add('lang-loaded');
+    const splash = document.getElementById('appSplash');
+    if (splash) setTimeout(() => splash.remove(), 400);
     if (waitLoad && typeof waitLoad.remove === 'function') {
         waitLoad.remove();
     }
@@ -101,6 +138,46 @@ function displayUptime(totalSeconds, className) {
         el.textContent = timeString;
     });
 }
+function renderUptimeChip(totalSeconds) {
+    const daysEl = get('upDays');
+    const hoursEl = get('upHours');
+    const minsEl = get('upMins');
+    if (!daysEl || !hoursEl || !minsEl || isNaN(totalSeconds)) return;
+    let seconds = Math.max(0, parseInt(totalSeconds, 10));
+    const days = Math.floor(seconds / (24 * 3600));
+    seconds %= (24 * 3600);
+    const hours = Math.floor(seconds / 3600);
+    seconds %= 3600;
+    const minutes = Math.floor(seconds / 60);
+    daysEl.textContent = String(days);
+    hoursEl.textContent = String(hours).padStart(2, '0');
+    minsEl.textContent = String(minutes).padStart(2, '0');
+    const chip = get('divUptimeChip');
+    if (chip) chip.title = `${days}d ${String(hours).padStart(2, '0')}h ${String(minutes).padStart(2, '0')}m`;
+}
+const uptimeClock = {
+    deviceBase: null,
+    netBase: null,
+    receivedAt: 0,
+    timer: null,
+    set(deviceSec, netSec) {
+        if (!isNaN(deviceSec)) this.deviceBase = parseInt(deviceSec, 10);
+        if (!isNaN(netSec)) this.netBase = parseInt(netSec, 10);
+        this.receivedAt = Date.now();
+        this.render();
+        if (!this.timer) this.timer = setInterval(() => this.render(), 1000);
+    },
+    render() {
+        if (this.deviceBase == null && this.netBase == null) return;
+        const elapsed = Math.floor((Date.now() - this.receivedAt) / 1000);
+        if (this.deviceBase != null) {
+            const total = this.deviceBase + elapsed;
+            displayUptime(total, 'uptime-display');
+            renderUptimeChip(total);
+        }
+        if (this.netBase != null) displayUptime(this.netBase + elapsed, 'net-display');
+    }
+};
 var errors = [
     { code: -10, key: 'ERR_PIN_TRANSCEIVER' },
     { code: -11, key: 'ERR_PIN_ETHERNET' },
@@ -558,7 +635,10 @@ async function initSockets() {
     for (let i = 0; i < wms.length; i++) {
         wms[i].remove();
     }
-    ui.waitMessage(get('divContainer')).classList.add('socket-wait');
+    const sockMsg = (typeof general !== 'undefined' && general.rebooting)
+        ? (tr('MSG_REBOOTING') || REBOOT_WAIT_FALLBACK)
+        : (tr('MSG_RECONNECTING') || 'Reconnecting… please wait');
+    ui.waitMessage(get('divContainer') || document.body, sockMsg).classList.add('socket-wait');
     let host = window.location.protocol === 'file:' ? hst : window.location.hostname;
     try {
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -584,6 +664,7 @@ async function initSockets() {
                         }
                         return value;
                     });
+                    if (typeof wifi !== 'undefined' && wifi.noteNetworkActivity) wifi.noteNetworkActivity(eventName);
                     switch (eventName) {
                         case 'memStatus':
                             firmware.procMemoryStatus(msg);
@@ -596,6 +677,9 @@ async function initSockets() {
                             break;
                         case 'remoteFrame':
                             somfy.procRemoteFrame(msg);
+                            break;
+                        case 'txFrame':
+                            somfy.procTxFrame(msg);
                             break;
                         case 'groupState':
                             somfy.procGroupState(msg);
@@ -628,6 +712,15 @@ async function initSockets() {
                         case 'frequencyScan':
                             somfy.procFrequencyScan(msg);
                             break;
+                        case 'fixedCodeState':
+                            somfy.procFixedCodeState(msg);
+                            break;
+                        case 'fixedCodeLearn':
+                            somfy.procFixedCodeLearn(msg);
+                            break;
+                        case 'fixedCodeRemoved':
+                            somfy.procFixedCodeRemoved(msg);
+                            break;
                     }
                 } catch (err) {
                     console.log({ eventName: eventName, data: data, err: err });
@@ -650,6 +743,7 @@ async function initSockets() {
             for (let i = 0; i < errs.length; i++)
                 errs[i].remove();
             if (general.reloadApp) {
+                general.rebooting = false;
                 general.reload();
             }
             else {
@@ -666,8 +760,12 @@ async function initSockets() {
         socket.onclose = (evt) => {
             wifi.procWifiStrength({ ssid: '', channel: -1, strength: -100 });
             wifi.procEthernet({ connected: false, speed: 0, fullduplex: false });
-            if (document.getElementsByClassName('socket-wait').length === 0)
-                ui.waitMessage(get('divContainer')).classList.add('socket-wait');
+            if (document.getElementsByClassName('socket-wait').length === 0) {
+                const msg = general.rebooting
+                    ? (tr('MSG_REBOOTING') || REBOOT_WAIT_FALLBACK)
+                    : (tr('MSG_RECONNECTING') || 'Reconnecting… please wait');
+                ui.waitMessage(get('divContainer') || document.body, msg).classList.add('socket-wait');
+            }
             if (evt.wasClean) {
                 console.log({ msg: 'close-clean', evt: evt });
                 connectFailed = 0;
@@ -711,6 +809,7 @@ async function initSockets() {
     }
 }
 function clearOverlays() {
+    if (typeof firmware !== 'undefined' && firmware.isUpdateBusy && firmware.isUpdateBusy()) return;
     const selectors = ['.inst-overlay', '.info-message', '.prompt-message', '.error-message', '.instructions', '#divGitInstall'];
     selectors.forEach(s => document.querySelectorAll(s).forEach(el => el.remove()));
 }
@@ -751,35 +850,34 @@ function syncNavigationState(groupId, isSubTab = false) {
 function bindNavigation() {
     document.querySelectorAll('.nav-item, .sub-nav-item').forEach(item => {
         item.addEventListener('click', (e) => {
+            if (typeof firmware !== 'undefined' && firmware.isUpdateBusy && firmware.isUpdateBusy()) {
+                e.preventDefault();
+                e.stopPropagation();
+                return;
+            }
             e.preventDefault();
             clearOverlays();
             const groupId = item.getAttribute('data-grpid');
             const isSub = item.classList.contains('sub-nav-item');
 
             if (groupId === 'divHomePnl') {
-                if (typeof ui !== 'undefined') ui.setHomePanel();
-                syncNavigationState(groupId);
+                if (typeof ui !== 'undefined') ui.goHome();
                 return;
             }
-            if (typeof ui !== 'undefined' && !ui.isConfigOpen()) {
-                if (typeof security !== 'undefined' && !security.authenticated && security.type !== 0) {
-                    get('divContainer').addEventListener('afterlogin', () => {
-                        if (security.authenticated) {
-                            ui.setConfigPanel();
-                            item.click();
-                        }
-                    }, { once: true });
-                    security.authUser();
-                    return;
-                }
-                ui.setConfigPanel();
+            if (typeof ui !== 'undefined') {
+                ui.openSettingsSection(isSub ? item.closest('.nav-group')?.querySelector('.nav-item')?.getAttribute('data-grpid') || groupId : groupId);
             }
-            const selector = isSub ? `.subtab-container > span[data-grpid="${groupId}"]` : `.tab-container > span[data-grpid="${groupId}"]`;
+            if (isSub) {
+                const originalTab = document.querySelector(`.subtab-container > span[data-grpid="${groupId}"]`);
+                if (originalTab) originalTab.click();
+                return;
+            }
+            const selector = `.tab-container > span[data-grpid="${groupId}"]`;
             const originalTab = document.querySelector(selector);
 
             if (originalTab) {
                 originalTab.click();
-            } else if (!isSub) {
+            } else {
                 syncNavigationState(groupId);
                 const firstSub = item.nextElementSibling?.querySelector('.sub-nav-item');
                 if (firstSub) firstSub.click();
@@ -788,10 +886,18 @@ function bindNavigation() {
     });
     document.querySelectorAll('.tab-container > span, .subtab-container > span').forEach(tab => {
         tab.addEventListener('click', (evt) => {
+            if (typeof firmware !== 'undefined' && firmware.isUpdateBusy && firmware.isUpdateBusy()) {
+                evt.preventDefault();
+                evt.stopPropagation();
+                return;
+            }
             const groupId = tab.getAttribute('data-grpid');
             const isSub = tab.parentElement.classList.contains('subtab-container');
             syncNavigationState(groupId, isSub);
             if (!isSub) {
+                if (typeof ui !== 'undefined') ui.setShellMode('settings', groupId);
+                const hub = get('divSettingsHub');
+                if (hub) hub.style.display = 'none';
                 if (groupId !== 'divSomfySettings' && typeof somfy !== 'undefined') {
                     somfy.showEditShade(false); somfy.showEditGroup(false);
                 }
@@ -912,14 +1018,37 @@ async function init() {
     somfy.init();
     mqtt.init();
     firmware.init();
+    if (typeof mesh !== 'undefined') mesh.init();
     somfy.setStep('freq', 1);
     somfy.setStep('bandwidth', 1);
     somfy.setStep('deviation', 1);
 
     bindNavigation();
+    document.addEventListener('click', (e) => {
+        const el = e.target.closest && e.target.closest('.copyable');
+        if (!el || typeof ui === 'undefined') return;
+        e.preventDefault();
+        e.stopPropagation();
+        ui.copyText(el);
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key !== 'Escape') return;
+        const fld = get('fldHomeSearch');
+        if (fld && fld.value && document.documentElement.getAttribute('data-shell') !== 'settings') {
+            fld.value = '';
+            if (typeof somfy !== 'undefined') {
+                somfy.filterHome('');
+                somfy.toggleHomeSearch(false);
+            }
+            e.preventDefault();
+        }
+    });
     if (typeof ui !== 'undefined' && !ui.isConfigOpen()) {
         const hBtn = document.querySelector('.nav-item[data-grpid="divHomePnl"]');
-        if (hBtn) syncNavigationState('divHomePnl');
+        if (hBtn) {
+            syncNavigationState('divHomePnl');
+            if (typeof ui !== 'undefined') ui.setShellMode('home');
+        }
     }
 }
 class UIBinder {
@@ -1193,11 +1322,14 @@ class UIBinder {
         }
         return v;
     }
-    waitMessage(el) {
+    waitMessage(el, text) {
         let div = document.createElement('div');
-        div.innerHTML = '<div class="lds-roller"><div></div><div></div><div></div><div></div><div></div><div></div><div></div><div></div></div>';
+        const label = text
+            ? `<div class="reboot-wait-text">${text}</div>`
+            : '';
+        div.innerHTML = `<div class="reboot-wait-box"><div class="lds-roller"><div></div><div></div><div></div><div></div><div></div><div></div><div></div><div></div></div>${label}</div>`;
         div.classList.add('wait-overlay');
-        if (typeof el === 'undefined') el = get('divContainer');
+        if (typeof el === 'undefined' || !el) el = get('divContainer') || document.body;
         el.appendChild(div);
         return div;
     }
@@ -1336,6 +1468,40 @@ class UIBinder {
         }, 3500);
         return div;
     }
+    copyText(el) {
+        const t = (typeof el === 'string' ? el : ((el && el.textContent) || '')).replace(/\s+/g, ' ').trim();
+        if (!t || /^-+$/.test(t) || t === '--' || t.indexOf('--:') === 0) return;
+        const done = () => {
+            document.querySelectorAll('.copy-toast').forEach(n => n.remove());
+            const div = document.createElement('div');
+            div.className = 'success-toast copy-toast';
+            div.innerHTML = `<div class="success-content"><span>${tr('COPIED') || 'Copied'}</span></div>`;
+            (get('divContainer') || document.body).appendChild(div);
+            setTimeout(() => { div.classList.add('hide'); setTimeout(() => div.remove(), 300); }, 1100);
+        };
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(t).then(done).catch(() => {});
+        } else done();
+    }
+    copyNetworkIp() {
+        const ip = (typeof wifi !== 'undefined' && wifi.netInfo && wifi.netInfo.ip) || window.location.hostname || '';
+        this.copyText(ip);
+    }
+    errorToast(msg) {
+        let el = get('divContainer');
+        document.querySelectorAll('.error-toast').forEach((n) => n.remove());
+        let div = document.createElement('div');
+        div.innerHTML = `<div class="success-content"><span>${msg}</span></div>`;
+        div.classList.add('error-toast');
+        el.appendChild(div);
+        setTimeout(() => {
+            div.classList.add('hide');
+            setTimeout(() => {
+                if (div.parentNode) div.remove();
+            }, 400);
+        }, 3500);
+        return div;
+    }
     toggleExpertMode(el) {
         this.isExpertMode = !this.isExpertMode;
         localStorage.setItem('expertMode', this.isExpertMode);
@@ -1384,6 +1550,11 @@ class UIBinder {
 
         const targetSection = get(groupId);
         if (targetSection) targetSection.style.display = '';
+        if (groupId === 'divAlexa' && typeof alexa !== 'undefined') alexa.loadPage();
+        if (['divSomfySettings', 'divMeshSettings', 'divRadioSettings', 'divNetworkSettings', 'divSystemSettings'].includes(groupId)) {
+            this.setSettingsPageTitle(groupId);
+            document.documentElement.setAttribute('data-settings-section', groupId);
+        }
     }
     wizSetPrevStep(el) { this.wizSetStep(el, Math.max(this.wizCurrentStep(el) - 1, 1)); }
     wizSetNextStep(el) { this.wizSetStep(el, this.wizCurrentStep(el) + 1); }
@@ -1461,80 +1632,156 @@ class UIBinder {
         evt.srcElement.select();
     }
     isConfigOpen() { return window.getComputedStyle(get('divConfigPnl')).display !== 'none'; }
-    setConfigPanel() {
-        if (this.isConfigOpen()) return;
+    setShellMode(mode, section) {
+        const root = document.documentElement;
+        root.setAttribute('data-shell', mode === 'settings' ? 'settings' : 'home');
+        if (mode === 'settings') root.setAttribute('data-settings-section', section || 'hub');
+        else root.removeAttribute('data-settings-section');
+        document.querySelectorAll('.bottom-nav-item').forEach(btn => {
+            btn.classList.toggle('is-active', btn.getAttribute('data-shell') === (mode === 'settings' ? 'settings' : 'home'));
+        });
+    }
+    goHome() {
+        this.setHomePanel();
+        syncNavigationState('divHomePnl');
+    }
+    goSettings() {
+        if (!security.authenticated && security.type !== 0) {
+            get('divContainer').addEventListener('afterlogin', () => {
+                if (security.authenticated) this.goSettings();
+            }, { once: true });
+            security.authUser();
+            return;
+        }
+        this.setConfigPanel();
+        this.showSettingsHub();
+    }
+    showSettingsHub() {
+        this.setShellMode('settings', 'hub');
+        const hub = get('divSettingsHub');
+        if (hub) hub.style.display = '';
+        const rail = get('spanSettingsRailTitle');
+        if (rail) rail.textContent = tr('TAB_SETTINGS') || 'Settings';
+        document.querySelectorAll('.tab-container > span').forEach(t => {
+            const panel = get(t.getAttribute('data-grpid'));
+            if (panel) panel.style.display = 'none';
+        });
+    }
+    setSettingsPageTitle(groupId) {
+        const keys = {
+            divSomfySettings: 'TAB_DEVICES',
+            divMeshSettings: 'TAB_MESH',
+            divRadioSettings: 'TAB_RADIO',
+            divNetworkSettings: 'TAB_NETWORK',
+            divSystemSettings: 'TAB_SYSTEM'
+        };
+        const title = tr(keys[groupId] || 'TAB_SETTINGS');
+        const el = get('spanSettingsPageTitle');
+        if (el) el.textContent = title;
+        const rail = get('spanSettingsRailTitle');
+        if (rail) rail.textContent = (groupId && groupId !== 'hub') ? title : (tr('TAB_SETTINGS') || 'Settings');
+    }
+    openSettingsSection(groupId) {
+        document.documentElement.setAttribute('data-settings-section', groupId);
+        this.setConfigPanel(true);
+        this.setShellMode('settings', groupId);
+        this.setSettingsPageTitle(groupId);
+        const hub = get('divSettingsHub');
+        if (hub) hub.style.display = 'none';
+        const tab = document.querySelector(`.tab-container [data-grpid="${groupId}"]`);
+        if (tab) {
+            this.selectTab(tab);
+            if (groupId === 'divNetworkSettings' && typeof wifi !== 'undefined') wifi.loadNetwork();
+        } else syncNavigationState(groupId);
+    }
+    setConfigPanel(keepSection) {
         let divCfg = get('divConfigPnl');
         let divHome = get('divHomePnl');
-        divHome.style.display = 'none';
-        divCfg.style.display = '';
-        somfy.checkEmptyState();
-        document.querySelector('#btnConfig use').setAttribute('href', '#svg-tabHome');
+        if (divHome) divHome.style.display = 'none';
+        if (divCfg) divCfg.style.display = '';
+        if (typeof somfy !== 'undefined') somfy.checkEmptyState();
+        const use = document.querySelector('#btnConfig use');
+        if (use) use.setAttribute('href', '#svg-tabHome');
+        const section = document.documentElement.getAttribute('data-settings-section') || 'hub';
+        this.setShellMode('settings', section);
+        if (!keepSection || section === 'hub') this.showSettingsHub();
 
         if (sockIsOpen) socket.send('join:0');
-        let overlay = ui.waitMessage(get('divSecurityOptions'));
-        overlay.style.borderRadius = '5px';
-        getJSON('/getSecurity', (err, security) => {
-            overlay.remove();
+        const secEl = get('divSecurityOptions');
+        let overlay = secEl ? ui.waitMessage(secEl) : null;
+        if (overlay) overlay.style.borderRadius = '5px';
+        getJSON('/getSecurity', (err, securityCfg) => {
+            if (overlay) overlay.remove();
             if (err) ui.serviceError(err);
-            else {
-                //console.log(security);
-                general.setSecurityConfig(security);
-            }
+            else general.setSecurityConfig(securityCfg);
         });
     }
     setHomePanel() {
-        if (!this.isConfigOpen()) return;
         let divCfg = get('divConfigPnl');
         let divHome = get('divHomePnl');
-        divHome.style.display = '';
-        divCfg.style.display = 'none';
-        somfy.checkEmptyState();
-        document.querySelector('#btnConfig use').setAttribute('href', '#svg-tabSettings');
+        if (divHome) divHome.style.display = '';
+        if (divCfg) divCfg.style.display = 'none';
+        if (typeof somfy !== 'undefined') {
+            somfy.checkEmptyState();
+            somfy.refreshHomeChrome();
+        }
+        const use = document.querySelector('#btnConfig use');
+        if (use) use.setAttribute('href', '#svg-tabSettings');
+        this.setShellMode('home');
         if (sockIsOpen) socket.send('leave:0');
         general.setSecurityConfig({ type: 0, username: '', password: '', pin: '', permissions: 0 });
     }
     toggleConfig() {
-        if (this.isConfigOpen())
-            this.setHomePanel();
-        else {
-            if (!security.authenticated && security.type !== 0) {
-                get('divContainer').addEventListener('afterlogin', (evt) => {
-                    if (security.authenticated) this.setConfigPanel();
-                }, { once: true });
-                    security.authUser();
-            }
-            else this.setConfigPanel();
-        }
-        somfy.showEditShade(false);
-        somfy.showEditGroup(false);
-    }
-    showNetworkConfig() {
-        this.setConfigPanel();
-        const tab = document.querySelector('.tab-container [data-grpid="divNetworkSettings"]');
-        if (tab) {
-            this.selectTab(tab);
-            if (typeof wifi !== 'undefined') wifi.loadNetwork();
+        if (this.isConfigOpen()) this.goHome();
+        else this.goSettings();
+        if (typeof somfy !== 'undefined') {
+            somfy.showEditShade(false);
+            somfy.showEditGroup(false);
         }
     }
-    showRadioConfig() {
-        this.setConfigPanel();
-        const tab = document.querySelector('.tab-container [data-grpid="divRadioSettings"]');
-        if (tab) this.selectTab(tab);
-    }
-    showSystemConfig() {
-        this.setConfigPanel();
-        const tab = document.querySelector('.tab-container [data-grpid="divSystemSettings"]');
-        if (tab) this.selectTab(tab);
-    }
+    showNetworkConfig() { this.openSettingsSection('divNetworkSettings'); }
+    showRadioConfig() { this.openSettingsSection('divRadioSettings'); }
+    showSystemConfig() { this.openSettingsSection('divSystemSettings'); }
     showShadeConfig() {
-        this.setConfigPanel();
-        const parentTab = document.querySelector('.tab-container [data-grpid="divSomfySettings"]');
-        if (parentTab) this.selectTab(parentTab);
+        this.openSettingsSection('divSomfySettings');
         const motorTab = document.querySelector('.subtab-container [data-grpid="divSomfyMotors"]');
         if (motorTab) this.selectTab(motorTab);
         if (typeof somfy !== 'undefined') {
             somfy.showEditShade(true);
             somfy.openEditShade();
+        }
+    }
+    setWelcomeChip(id, done) {
+        const chip = get(id);
+        if (chip) chip.classList.toggle('is-done', !!done);
+    }
+    updateWelcomeChecklist() {
+        const netOk = !!(typeof wifi !== 'undefined' && wifi.linkUp);
+        const cfg = (typeof somfy !== 'undefined' && somfy.transceiver && somfy.transceiver.config) ? somfy.transceiver.config : null;
+        const radioOk = !!(cfg && cfg.radioInit);
+        const ready = netOk && radioOk;
+
+        const netStep = get('welcomeStepNet');
+        const radStep = get('welcomeStepRadio');
+        if (netStep) netStep.hidden = !!netOk;
+        if (radStep) radStep.hidden = !!radioOk;
+        const setup = get('welcomeSetupList');
+        if (setup) setup.hidden = !!ready;
+
+        this.setWelcomeChip('welcomeChipNet', netOk);
+        this.setWelcomeChip('welcomeChipRadio', radioOk);
+
+        const title = get('welcomeTitle');
+        const desc = get('welcomeDesc');
+        const titleKey = ready ? 'WELCOME_EMPTY_TITLE' : 'WELCOME';
+        const descKey = ready ? 'WELCOME_DESC_READY' : 'WELCOME_DESC';
+        if (title) {
+            title.setAttribute('tr', titleKey);
+            title.textContent = tr(titleKey);
+        }
+        if (desc) {
+            desc.setAttribute('tr', descKey);
+            desc.textContent = tr(descKey);
         }
     }
 }
@@ -1544,16 +1791,22 @@ class Security {
     authenticated = false;
     apiKey = '';
     permissions = 0;
+    setLoginVisible(show) {
+        const pnl = get('divUnauthenticated');
+        if (pnl) pnl.style.display = show ? 'flex' : 'none';
+        document.documentElement.classList.toggle('login-required', !!show);
+    }
     async init() {
         let fld = get('divUnauthenticated').querySelector('.pin-digit[data-bind="security.pin.d0"]');
         get('divUnauthenticated').querySelector('.pin-digit[data-bind="login.pin.d3"]').addEventListener('digitentered', (evt) => {
             security.login();
         });
+        document.documentElement.classList.add('login-required');
         await this.loadContext();
         if (this.type === 0 || (this.permissions & 0x01) === 0x01) { // No login required or only the config is protected.
             if (typeof socket === 'undefined' || !socket) (async () => { await initSockets(); })();
             //ui.setMode(mode);
-            get('divUnauthenticated').style.display = 'none';
+            this.setLoginVisible(false);
             get('divAuthenticated').style.display = '';
             get('divContainer').setAttribute('data-auth', true);
         }
@@ -1565,7 +1818,7 @@ class Security {
         // Cache groupé des éléments de login
         const qs = (s) => pnl.querySelector(s);
         const btn = qs('#loginButtons'), pwd = qs('#divLoginPassword'), pin = qs('#divLoginPin');
-        pnl.style.display = btn.style.display = pwd.style.display = pin.style.display = 'none';
+        btn.style.display = pwd.style.display = pin.style.display = 'none';
 
         return new Promise(res => {
             loadLang(() => {
@@ -1573,8 +1826,11 @@ class Security {
                     if (err) return ui.serviceError(err), res();
 
                     // Uptime & Info CPU
-                    if (ctx.uptime) displayUptime(ctx.uptime, 'uptime-display');
-                    if (ctx.netUptime) displayUptime(ctx.netUptime, 'net-display');
+                    if (ctx.uptime != null || ctx.netUptime != null) {
+                        uptimeClock.set(ctx.uptime, ctx.netUptime);
+                    }
+                    if (typeof wifi !== 'undefined' && wifi.applyLoginContext) wifi.applyLoginContext(ctx);
+                    if (ctx.version) general.setTopVersion(ctx.version);
                     if (ctx.cpuFreq) get('info-cpu').textContent = `${ctx.cores > 1 ? 'Dual' : 'Single'}-Core @ ${ctx.cpuFreq} ${tr('MHZ')}`;
                     // Flash & FileSystem (Regroupé)
                     if (ctx.flashSize) {
@@ -1592,6 +1848,9 @@ class Security {
 
                     this.type = ctx.type;
                     this.permissions = ctx.permissions;
+                    const roles = ['unset', 'router', 'repeater'];
+                    document.documentElement.setAttribute('data-mesh-role', roles[ctx.meshRole] || 'unset');
+                    document.documentElement.setAttribute('data-mesh-connected', ctx.connected ? '1' : '0');
 
                     const cont = get('divContainer');
                     if (cont) cont.setAttribute('data-securitytype', ctx.type);
@@ -1606,7 +1865,7 @@ class Security {
 
                         const typeFld = qs('#fldLoginType');
                         if (typeFld) typeFld.value = ctx.type;
-                        pnl.style.display = 'flex';
+                        this.setLoginVisible(true);
                     }
                     res();
                 });
@@ -1615,14 +1874,14 @@ class Security {
     }
     authUser() {
         get('divAuthenticated').style.display = 'none';
-        get('divUnauthenticated').style.display = '';
+        this.setLoginVisible(true);
         this.loadContext();
         get('btnCancelLogin').style.display = 'inline-block';
     }
     cancelLogin() {
         let evt = new CustomEvent('afterlogin', { detail: { authenticated: this.authenticated } });
         get('divAuthenticated').style.display = '';
-        get('divUnauthenticated').style.display = 'none';
+        this.setLoginVisible(false);
         get('divContainer').dispatchEvent(evt);
     }
     login() {
@@ -1651,13 +1910,14 @@ class Security {
                 if (log.success) {
                     if (typeof socket === 'undefined' || !socket) (async () => { await initSockets(); })();
 
-                    get('divUnauthenticated').style.display = 'none';
+                    this.setLoginVisible(false);
                     get('divAuthenticated').style.display = '';
                     get('divContainer').setAttribute('data-auth', true);
                     this.apiKey = log.apiKey;
                     this.authenticated = true;
                     let evt = new CustomEvent('afterlogin', { detail: { authenticated: true } });
                     get('divContainer').dispatchEvent(evt);
+                    if (typeof mesh !== 'undefined') mesh.onLoggedIn();
                 }
                 else
                     msg.innerHTML = tr(log.msg);
@@ -1680,16 +1940,25 @@ class Security {
 var security = new Security();
 class General {
     initialized = false;
-    appVersion = 'v2.5.6';
+    appVersion = '';
     reloadApp = false;
+    rebooting = false;
     init() {
         if (this.initialized) return;
 
-        const savedTheme = localStorage.getItem('themeMode') || '0';
+        const savedTheme = this.normalizeThemeId(localStorage.getItem('themeMode') || 'ocean');
         this.applyTheme(savedTheme);
-        const savedColor = localStorage.getItem('accentColor');
-        if (savedColor) {
-            document.documentElement.style.setProperty('--accent-color', savedColor);
+        this.applyShadeView(localStorage.getItem('shadeView') || 'large');
+        this.applyRfTxDebug(localStorage.getItem('rfTxDebug') === '1');
+        const savedColor = localStorage.getItem('accentColor') || '#009BFF';
+        document.documentElement.style.setProperty('--accent-color', savedColor);
+        // Keep Auto theme in sync when OS appearance changes.
+        if (window.matchMedia) {
+            window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+                if (this.normalizeThemeId(localStorage.getItem('themeMode') || 'auto') === 'auto') {
+                    this.applyTheme('auto');
+                }
+            });
         }
         this.setAppVersion();
         this.setTimeZones();
@@ -1700,23 +1969,203 @@ class General {
 
         this.initialized = true;
     }
+    normalizeThemeId(val) {
+        const map = {
+            '0': 'auto',
+            '1': 'apple-dark',
+            '2': 'apple-light',
+            dark: 'apple-dark',
+            light: 'apple-light'
+        };
+        const id = map[val] || val || 'ocean';
+        const allowed = [
+            'auto', 'apple-light', 'apple-dark', 'graphite', 'sunset', 'mint',
+            'ocean', 'midnight', 'forest', 'rose', 'sand', 'slate', 'nord', 'solar', 'lavender', 'contrast'
+        ];
+        return allowed.includes(id) ? id : 'ocean';
+    }
+    resolveThemeId(val) {
+        const id = this.normalizeThemeId(val);
+        if (id !== 'auto') return id;
+        return window.matchMedia('(prefers-color-scheme: dark)').matches
+            ? 'apple-dark'
+            : 'apple-light';
+    }
     applyTheme(val) {
-        if (val === '1') {
-            document.documentElement.setAttribute('data-theme', 'dark');
-        } else if (val === '2') {
-            document.documentElement.setAttribute('data-theme', 'light');
-        } else {
-            const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-            document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
-        }
+        const stored = this.normalizeThemeId(val);
+        localStorage.setItem('themeMode', stored);
+        document.documentElement.setAttribute('data-theme', this.resolveThemeId(stored));
+        // Theme pack sets default accent; keep user accent override if present.
+        const savedColor = localStorage.getItem('accentColor') || '#009BFF';
+        document.documentElement.style.setProperty('--accent-color', savedColor);
         const sel = get('selThemeMode');
-        if (sel) sel.value = val;
+        if (sel) sel.value = stored;
     }
     onModeThemeChanged() {
         const sel = get('selThemeMode');
-        const val = sel.value;
-        localStorage.setItem('themeMode', val);
-        this.applyTheme(val);
+        if (!sel) return;
+        this.applyTheme(sel.value);
+    }
+    normalizeShadeView(val) {
+        return (val === 'small' || val === 'compact' || val === 'large') ? val : 'large';
+    }
+    applyShadeView(val) {
+        const view = this.normalizeShadeView(val);
+        localStorage.setItem('shadeView', view);
+        document.documentElement.setAttribute('data-shade-view', view);
+        document.querySelectorAll('.shade-view-btn').forEach(btn => {
+            btn.classList.toggle('active', btn.getAttribute('data-view') === view);
+        });
+    }
+    applyRfTxDebug(on) {
+        const enabled = !!on;
+        localStorage.setItem('rfTxDebug', enabled ? '1' : '0');
+        const cb = get('cbRfTxDebug');
+        if (cb) cb.checked = enabled;
+        const pane = get('divTxDebugFloat');
+        if (!pane) return;
+        pane.classList.toggle('is-open', enabled);
+        pane.style.display = '';
+        pane.setAttribute('aria-hidden', enabled ? 'false' : 'true');
+        if (enabled) {
+            pane.classList.toggle('minimized', localStorage.getItem('rfTxDebugMin') === '1');
+            this.restoreRfTxDebugGeom();
+            this.initRfTxDebugDrag();
+            const list = get('divTxFrames');
+            if (list && !list.querySelector('.tx-debug-row')) {
+                this.renderTxDebugEmpty(list);
+            }
+            this.refreshTxDebugChrome();
+        }
+    }
+    onRfTxDebugChanged() {
+        const cb = get('cbRfTxDebug');
+        this.applyRfTxDebug(!!(cb && cb.checked));
+    }
+    renderTxDebugEmpty(list) {
+        const el = list || get('divTxFrames');
+        if (!el) return;
+        el.innerHTML = '<div class="tx-debug-empty" tr="TX_DEBUG_EMPTY">Waiting for TX… press Up/Down/My</div>';
+    }
+    refreshTxDebugChrome() {
+        const list = get('divTxFrames');
+        const count = get('spanTxDebugCount');
+        const n = list ? list.querySelectorAll('.tx-debug-row').length : 0;
+        if (count) count.textContent = n ? String(n) : '';
+    }
+    toggleRfTxDebugMin() {
+        const pane = get('divTxDebugFloat');
+        if (!pane) return;
+        const min = !pane.classList.contains('minimized');
+        pane.classList.toggle('minimized', min);
+        localStorage.setItem('rfTxDebugMin', min ? '1' : '0');
+        if (min) {
+            pane.style.width = '';
+            pane.style.height = '';
+        } else {
+            this.restoreRfTxDebugGeom();
+        }
+    }
+    restoreRfTxDebugGeom() {
+        const pane = get('divTxDebugFloat');
+        if (!pane) return;
+        try {
+            const pos = JSON.parse(localStorage.getItem('rfTxDebugPos') || 'null');
+            if (pos && typeof pos.left === 'number' && typeof pos.top === 'number') {
+                const maxL = Math.max(0, window.innerWidth - 80);
+                const maxT = Math.max(0, window.innerHeight - 40);
+                pane.style.left = Math.min(Math.max(0, pos.left), maxL) + 'px';
+                pane.style.top = Math.min(Math.max(0, pos.top), maxT) + 'px';
+                pane.style.right = 'auto';
+                pane.style.bottom = 'auto';
+            }
+            if (!pane.classList.contains('minimized')) {
+                const sz = JSON.parse(localStorage.getItem('rfTxDebugSize') || 'null');
+                if (sz && typeof sz.width === 'number' && typeof sz.height === 'number') {
+                    pane.style.width = Math.min(Math.max(320, sz.width), window.innerWidth - 16) + 'px';
+                    pane.style.height = Math.min(Math.max(160, sz.height), window.innerHeight - 16) + 'px';
+                }
+            }
+        } catch (e) { /* ignore bad saved geom */ }
+    }
+    saveRfTxDebugGeom() {
+        const pane = get('divTxDebugFloat');
+        if (!pane) return;
+        const rect = pane.getBoundingClientRect();
+        localStorage.setItem('rfTxDebugPos', JSON.stringify({ left: rect.left, top: rect.top }));
+        if (!pane.classList.contains('minimized')) {
+            localStorage.setItem('rfTxDebugSize', JSON.stringify({ width: rect.width, height: rect.height }));
+        }
+    }
+    initRfTxDebugDrag() {
+        const pane = get('divTxDebugFloat');
+        const header = get('divTxDebugHeader');
+        const grip = get('divTxDebugResize');
+        if (!pane || !header || header.dataset.dragBound === '1') return;
+        header.dataset.dragBound = '1';
+        let mode = '';
+        let ox = 0, oy = 0, startW = 0, startH = 0;
+        const onMove = (ev) => {
+            if (!mode) return;
+            const pt = ev.touches ? ev.touches[0] : ev;
+            if (mode === 'drag') {
+                let left = pt.clientX - ox;
+                let top = pt.clientY - oy;
+                const maxL = Math.max(0, window.innerWidth - pane.offsetWidth);
+                const maxT = Math.max(0, window.innerHeight - 36);
+                left = Math.min(Math.max(0, left), maxL);
+                top = Math.min(Math.max(0, top), maxT);
+                pane.style.left = left + 'px';
+                pane.style.top = top + 'px';
+                pane.style.right = 'auto';
+                pane.style.bottom = 'auto';
+            } else if (mode === 'resize') {
+                const w = Math.min(Math.max(320, startW + (pt.clientX - ox)), window.innerWidth - 16);
+                const h = Math.min(Math.max(160, startH + (pt.clientY - oy)), window.innerHeight - 16);
+                pane.style.width = w + 'px';
+                pane.style.height = h + 'px';
+            }
+            if (ev.cancelable) ev.preventDefault();
+        };
+        const onUp = () => {
+            if (!mode) return;
+            mode = '';
+            this.saveRfTxDebugGeom();
+            window.removeEventListener('mousemove', onMove);
+            window.removeEventListener('mouseup', onUp);
+            window.removeEventListener('touchmove', onMove);
+            window.removeEventListener('touchend', onUp);
+        };
+        const start = (ev, next) => {
+            const pt = ev.touches ? ev.touches[0] : ev;
+            const rect = pane.getBoundingClientRect();
+            mode = next;
+            if (next === 'drag') {
+                ox = pt.clientX - rect.left;
+                oy = pt.clientY - rect.top;
+            } else {
+                ox = pt.clientX;
+                oy = pt.clientY;
+                startW = rect.width;
+                startH = rect.height;
+            }
+            window.addEventListener('mousemove', onMove);
+            window.addEventListener('mouseup', onUp);
+            window.addEventListener('touchmove', onMove, { passive: false });
+            window.addEventListener('touchend', onUp);
+        };
+        header.addEventListener('mousedown', (ev) => {
+            if (ev.target.closest('.tx-debug-actions')) return;
+            start(ev, 'drag');
+        });
+        header.addEventListener('touchstart', (ev) => {
+            if (ev.target.closest('.tx-debug-actions')) return;
+            start(ev, 'drag');
+        }, { passive: true });
+        if (grip) {
+            grip.addEventListener('mousedown', (ev) => { ev.stopPropagation(); start(ev, 'resize'); });
+            grip.addEventListener('touchstart', (ev) => { ev.stopPropagation(); start(ev, 'resize'); }, { passive: true });
+        }
     }
     getCookie(cname) {
         let n = cname + '=';
@@ -1844,37 +2293,26 @@ class General {
         "Pacific/Norfolk|<+11>-11<+12>,M10.1.0,M4.1.0/3"
     ];
     loadGeneral() {
-        const pnl = get('divSystemOptions');
-
         getJSONSync('/modulesettings', (err, settings) => {
             if (err) {
                 console.error(err);
                 return;
             }
-            console.log("Settings reçus:", settings);
+            console.log("Settings received:", settings);
             if (typeof somfy !== 'undefined') somfy.initPins();
 
             get('spanFwVersion').innerText = settings.fwVersion;
             get('spanHwVersion').innerText = settings.chipModel.length > 0 ? '-' + settings.chipModel : '';
             get('divContainer').setAttribute('data-chipmodel', settings.chipModel);
 
+            this.applyServerVersions(settings);
             this.setAppVersion();
 
             loadLang(() => {
-
-                ui.toElement(pnl, { general: settings });
-
-                const langSelect = get('langSelect');
-                if (langSelect) {
-                    const languages = [ 'en', 'fr', 'de', 'es', /*'it' */ ];
-                    const selectedLang = languages[settings.language] || 'en';
-                    localStorage.setItem('selectedLang', selectedLang);
-                    document.documentElement.lang = selectedLang;
-                    langSelect.value = selectedLang;
-                    langSelect.onchange = (e) => {
-                        this.onLanguageChanged(e.target.value);
-                    };
-                }
+                document.documentElement.lang = 'en';
+                ui.toElement(get('divSystemSettings'), { general: settings });
+                this.general = settings;
+                this.refreshAlexaHueCount();
             });
             if (settings.accentColor) {
                 document.documentElement.style.setProperty('--accent-color', settings.accentColor);
@@ -1889,14 +2327,13 @@ class General {
                     });
                 }
             }
+            this.applyRfTxDebug(localStorage.getItem('rfTxDebug') === '1');
 
         });
     }
     loadLogin() {
-        const savedColor = localStorage.getItem('accentColor');
-        if (savedColor) {
-            document.documentElement.style.setProperty('--accent-color', savedColor);
-        }
+        const savedColor = localStorage.getItem('accentColor') || '#009BFF';
+        document.documentElement.style.setProperty('--accent-color', savedColor);
         getJSONSync('/loginContext', (err, ctx) => {
             if (err) ui.serviceError(err);
             else {
@@ -1921,7 +2358,36 @@ class General {
             }
         });
     }
-    setAppVersion() { get('spanAppVersion').innerText = this.appVersion; }
+    setAppVersion() {
+        const el = get('spanAppVersion');
+        if (el) el.innerText = this.appVersion || '—';
+    }
+    setTopVersion(ver) {
+        const v = (ver || '').toString().trim();
+        if (!v) return;
+        document.querySelectorAll('.js-top-version').forEach((el) => { el.textContent = v; });
+    }
+    applyServerVersions(settings) {
+        if (!settings) return;
+        if (settings.fwVersion) {
+            const el = get('spanFwVersion');
+            if (el) el.innerText = settings.fwVersion;
+            this.setTopVersion(settings.fwVersion);
+        }
+        const app = typeof settings.appVersion === 'string'
+            ? settings.appVersion
+            : (settings.appVersion && settings.appVersion.name);
+        if (app) this.appVersion = app;
+        this.setAppVersion();
+    }
+    refreshVersions() {
+        return new Promise((resolve) => {
+            getJSONSync('/modulesettings', (err, settings) => {
+                if (!err && settings) this.applyServerVersions(settings);
+                resolve(settings || null);
+            });
+        });
+    }
     setTimeZones() {
         const dd = get('selTimeZone');
         dd.innerHTML = this.timeZones.map(tz => {
@@ -1953,6 +2419,7 @@ class General {
             valid = false;
         }
         if (valid) {
+            this.onRfTxDebugChanged();
             putJSONSync('/setgeneral', obj, (err, response) => {
                 if (err) {
                     ui.serviceError(err);
@@ -1962,6 +2429,23 @@ class General {
                 }
             });
         }
+    }
+    setUpdatePrefs() {
+        const check = !!get('cbCheckForUpdate')?.checked;
+        const autoInst = !!get('cbAutoInstallUpdate')?.checked;
+        if (autoInst && get('cbCheckForUpdate')) get('cbCheckForUpdate').checked = true;
+        putJSONSync('/setgeneral', {
+            checkForUpdate: autoInst ? true : check,
+            autoInstallUpdate: autoInst
+        }, (err) => {
+            if (err) ui.serviceError(err);
+        });
+    }
+    setAlexaHuePrefs() {
+        if (typeof alexa !== 'undefined') alexa.setEnabled(!!get('cbAlexaHueEnabled')?.checked);
+    }
+    refreshAlexaHueCount() {
+        if (typeof alexa !== 'undefined') alexa.refreshCount();
     }
     setSecurityConfig(security) {
         let obj = {
@@ -1979,54 +2463,36 @@ class General {
         ui.toElement(get('divSecurityOptions'), obj);
         this.onSecurityTypeChanged();
     }
+    showRebootWait(msg) {
+        this.rebooting = true;
+        document.querySelectorAll('.reboot-wait-overlay').forEach(el => el.remove());
+        const text = msg || tr('MSG_REBOOTING') || REBOOT_WAIT_FALLBACK;
+        const div = ui.waitMessage(document.body, text);
+        div.classList.add('reboot-wait-overlay');
+        div.style.zIndex = '20000';
+        return div;
+    }
     rebootDevice() {
         ui.promptMessage(get('divContainer'), tr('PROMPT_REBOOT_CONFIRM'), () => {
+            this.showRebootWait();
             if(typeof socket !== 'undefined') socket.close(3000, 'reboot');
             putJSONSync('/reboot', {}, (err, response) => {
-                get('btnSaveGeneral').classList.remove('disabled');
+                get('btnSaveGeneral')?.classList.remove('disabled');
                 console.log(response);
             });
             ui.clearErrors();
         });
     }
-    onLanguageChanged(lang, reload = true) {
-        const sel = get('langSelect');
-        if (sel) sel.disabled = true;
-        localStorage.setItem('selectedLang', lang);
-
-        fetch(baseUrl + '/setLang?lang=' + lang)
-        .then(r => r.json())
-        .then(resp => {
-            if (resp.status === "ok") {
-                if (reload) {
-                    window.location.reload(true);
-                } else {
-                    if (sel) {
-                        sel.value = lang;
-                        sel.disabled = false;
-                    }
-                }
-            }
-        })
-        .catch(err => {
-            console.error("Erreur lors du changement de langue:", err);
-            if (sel) sel.disabled = false;
+    resetOriginal() {
+        ui.promptMessage(get('divContainer'), tr('PROMPT_RESET_ORIGINAL'), () => {
+            putJSONSync('/mesh/resetOriginal', {}, (err) => {
+                if (err) return ui.serviceError(err);
+                document.documentElement.setAttribute('data-mesh-role', 'unset');
+                this.showRebootWait();
+                if (typeof socket !== 'undefined') socket.close(3000, 'reboot');
+                putJSONSync('/reboot', {}, () => {});
+            });
         });
-    }
-    onModeThemeChanged() {
-        const sel = get('selThemeMode');
-        const val = sel.value;
-
-        localStorage.setItem('themeMode', val);
-
-        if (val === '1') {
-            document.documentElement.setAttribute('data-theme', 'dark');
-        } else if (val === '2') {
-            document.documentElement.setAttribute('data-theme', 'light');
-        } else {
-            const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-            document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
-        }
     }
     onSecurityTypeChanged() {
         let pnl = get('divSecurityOptions'),
@@ -2071,113 +2537,6 @@ class General {
     secError(title, desc) {
         ui.errorMessage(tr(title)).querySelector('.sub-message').innerHTML = tr(desc);
     }
-    showLBCOverlay() {
-        const div = document.createElement('div');
-        div.id = 'divLBCConfig';
-        div.className = 'inst-overlay';
-
-        const steps = [
-            ['tz', 'Réglage du fuseau horaire Europe/Paris'],
-            ['lang', 'Passage de l\'interface en Français'],
-            ['gpio', 'Assignation des GPIO spécifiques au boîtier'],
-            ['radio', 'Activation de la radio']
-        ];
-
-        let stepsHtml = '';
-        for (const [id, text] of steps) {
-            stepsHtml += `<div id="lbc-step-${id}" class="divLbc-step"><div class="lbc-icon-wrapper"><svg id="svg-step-${id}" class="svgLbc-step"><use href="#svg-succes"></use></svg></div><span class="lbcLabel-step">${text}</span></div>`;
-        }
-
-        div.innerHTML = `
-        <div class="instructions-content">
-        <div class="overlay-scroll-content">
-        ${overlayHeader('Configuration Boîtier', 'Assistant de configuration automatique pour votre boitier', 'svg-leboncoin')}
-        <div>
-        <div class="warning"><svg><use href=#svg-warning></use></svg><div><span>Cet assistant est uniquement réservé aux personnes ayant acheté l'un de <a href="https://github.com/xkain/ESPSomfy-RTS/releases" target="_blank" class="link">mes boîtiers</a> sur Leboncoin, si ce n'est pas votre cas fermez cette page</span></div></div>
-        <div class="divInfoLine"><div class="InfoLine"><p>Par défaut, le firmware adopte des réglages universels et sécurisés. Cet assistant applique les paramètres régionaux et injecte la configuration matérielle de votre modèle.</p></div>
-        <p class="uppercaseText">1. Sélectionnez votre boîtier :</p>
-        <div class="button-container-row lbc-cards-container lbc-responsive-container">
-        <div class="unibloc chooseWifiEth lbc-responsive-card">
-        <label for="radBoxWifi" class="unibutton"><span>Wi-Fi</span><div class="box-image-container"><img src="editionWifi.webp" alt="Modèle Wi-Fi" /></div><div class="uniStatus">ESP32 D1 Mini + CC1101</div><div class="uniRight" style="margin-top: auto;"><input type="radio" id="radBoxWifi" name="lbcBoxType" value="1" checked></div></label>
-        </div>
-        <div class="unibloc chooseWifiEth lbc-responsive-card">
-        <label for="radBoxEth" class="unibutton"><span>Ethernet & Wi-Fi</span><div class="box-image-container"><img src="editionEthernet.webp" alt="Modèle Ethernet" /></div><div class="uniStatus">ESP32 WT32-ETH01 + CC1101</div><div class="uniRight" style="margin-top: auto;"><input type="radio" id="radBoxEth" name="lbcBoxType" value="2"></div></label>
-        </div>
-        </div>
-        <p class="uppercaseText">2. Actions prévues :</p>
-        <div id="lbc-steps-list">${stepsHtml}</div>
-        <div id="lbc-success-msg"><svg class="svgInTextSmall"><use href="#svg-success"></use></svg> Configuration appliquée avec succès !</div>
-        </div>
-        </div>
-        </div>
-        <div class="hrDivFooter"></div>
-        <div class="button-container-overlay">
-        <button id="btnCloseLBC" line type="button" onclick="closeOverlay(get('divLBCConfig'))">${tr('BT_CLOSE')}</button>
-        <button id="btnConfirmLBC" type="button" onclick="general.confirmLBCConfig()">Démarrer</button>
-        </div>
-        </div>
-        </div>`;
-
-        shOverlay(div);
-    }
-    confirmLBCConfig() {
-        ui.promptMessage(get('divContainer'), `Êtes-vous sûr d'avoir choisi le bon boîtier ?`, () => {
-            this.onLBCChanged('1');
-        });
-    }
-    async onLBCChanged(val) {
-        if (val !== "1") return;
-        const btn = get('btnConfirmLBC'), cls = get('btnCloseLBC');
-        if (btn) btn.style.display = 'none';
-        if (cls) cls.style.display = 'none';
-
-        const selectedBoxType = document.querySelector('input[name="lbcBoxType"]:checked')?.value || "1";
-        const validateStep = (id) => {
-            const row = get(`lbc-step-${id}`), svg = get(`svg-step-${id}`), lbl = row?.querySelector('.lbcLabel-step');
-            if (svg) {
-                svg.style.cssText = "color:#4CAF50;opacity:1;transform:scale(1.1)";
-                setTimeout(() => svg.style.transform = "scale(1)", 200);
-            }
-            if (lbl) lbl.style.cssText = "color:var(--text-color);font-weight:bold";
-        };
-            try {
-                // Étape 1 : Fuseau horaire
-                const tz = get('selTimeZone');
-                if (tz) { tz.value = "CET-1CEST-2,M3.5.0/02:00:00,M10.5.0/03:00:00"; tz.dispatchEvent(new Event('change')); }
-                validateStep('tz');
-                await new Promise(r => setTimeout(r, 500));
-
-                // Étape 2 : Langue
-                this.onLanguageChanged('fr', false);
-                validateStep('lang');
-                await new Promise(r => setTimeout(r, 500));
-
-                // Étape 3 : Assignation dynamique des GPIO en fonction du boîtier choisi
-                const sb = get('selRadioBoardType');
-                if (sb) {
-                    sb.value = selectedBoxType;
-                    sb.dispatchEvent(new Event('change'));
-                }
-                validateStep('gpio');
-                await new Promise(r => setTimeout(r, 500));
-
-                // Étape 4 : Activation de la radio et sauvegarde globale
-                const cb = get('cbEnableRadio');
-                if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change')); }
-
-                if (typeof this.setGeneral === 'function') this.setGeneral();
-                await new Promise(r => setTimeout(r, 800));
-
-                if (typeof somfy !== 'undefined' && typeof somfy.saveRadio === 'function') somfy.saveRadio();
-                validateStep('radio');
-
-                get('lbc-success-msg').style.display = 'block';
-                setTimeout(() => window.location.reload(true), 1500);
-
-            } catch (e) {
-                if (btn) { btn.style.display = 'block'; btn.textContent = "Réessayer"; }
-            }
-    }
     showHAOverlay() {
         const div = document.createElement('div');
         div.id = 'divHAConfig';
@@ -2209,12 +2568,12 @@ class General {
         </div>
         </div>
         <div class="ha-badge-container">
-        <a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=xkain&repository=ESPSomfy-RTS-enhanced&category=integration" target="_blank" class="ha-badge-button">
+        <a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=jcvsite&repository=ESPSomfy-RTS-HA&category=integration" target="_blank" class="ha-badge-button">
         <span class="ha-badge-text-main">Open HACS repository on</span>
         <span class="ha-badge-pill"><span class="ha-badge-text-pill">MY</span><svg width="18" height="18"><use href="#svg-homeAssistant"></use></svg></span>
         </a>
         <p class="ha-github-link-container">
-        ${tr('HACS_OR_VISIT')} <a href="https://github.com/xkain/ESPSomfy-RTS-enhanced" target="_blank" class="linkSoft">dépôt GitHub</a>
+        ${tr('HACS_OR_VISIT')} <a href="https://github.com/jcvsite/ESPSomfy-RTS-HA" target="_blank" class="linkSoft">GitHub repository</a>
         </p>
         </div>
         </div>
@@ -2234,6 +2593,9 @@ class Wifi {
     ethBoardTypes = [];
     ethClockModes = [];
     ethPhyTypes = [];
+    connKind = 'wifi';
+    linkUp = false;
+    netInfo = { kind: 'wifi', ssid: '', ip: '', hostname: '', gateway: '', channel: -1, rssi: -100, speed: 0, duplex: false };
 
     init() {
         this.ethBoardTypes = [
@@ -2421,7 +2783,29 @@ class Wifi {
         this.updateEthernetSummary('PWRPin', -1);
         this.togglePowerIcon(true); // Mode None -> Icône OFF
     }
-    onDHCPClicked(cb) { get('divStaticIP').style.display = cb.checked ? 'none' : ''; }
+    onDHCPClicked(cb) {
+        get('divStaticIP').style.display = cb.checked ? 'none' : '';
+        this.refreshIpModeLabel(!!cb.checked);
+    }
+    refreshIpModeLabel(isDhcp) {
+        const label = isDhcp
+            ? (tr('ADRESSIP_DHCP') || 'DHCP')
+            : (tr('ADRESSIP_STATIC_IP') || 'Static');
+        const main = get('spanIpMode');
+        if (main) main.textContent = label;
+        document.querySelectorAll('.spanIpModeEth').forEach(el => { el.textContent = label; });
+    }
+    toggleIpEdit(force) {
+        const ed = get('divDHCP');
+        if (!ed) return;
+        const open = typeof force === 'boolean' ? force : ed.style.display === 'none';
+        ed.style.display = open ? '' : 'none';
+        if (open) {
+            const dhcp = get('cbDHCP');
+            if (dhcp) this.onDHCPClicked(dhcp);
+            ed.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        }
+    }
 
     loadNetwork() {
         let pnl = get('divNetAdapter');
@@ -2455,34 +2839,144 @@ class Wifi {
                 get('divETHSettings').style.display = settings.ethernet.boardType === 0 ? '' : 'none';
                 get('divStaticIP').style.display = settings.ip.dhcp ? 'none' : '';
                 get('spanCurrentIP').innerHTML = settings.ip.ip;
+                this.refreshIpModeLabel(!!settings.ip.dhcp);
+                const ipEdit = get('divDHCP');
+                if (ipEdit && !ipEdit.contains(document.activeElement)) ipEdit.style.display = 'none';
+                this.netInfo = Object.assign({}, this.netInfo, {
+                    hostname: settings.hostname || '',
+                    ip: (settings.ip && settings.ip.ip) || '',
+                    gateway: (settings.ip && settings.ip.gateway) || '',
+                    ssid: (settings.wifi && settings.wifi.ssid) || this.netInfo.ssid || ''
+                });
+                this.fillCopyFields();
                 this.updateStatusBadge(settings);
                 this.syncRadiosWithCheckbox();
                 this.useEthernetClicked();
                 this.hiddenSSIDClicked();
+                this.refreshConnTip();
             }
         });
     }
+    applyLoginContext(ctx) {
+        if (!ctx) return;
+        if (typeof ctx.connected === 'boolean') this.linkUp = ctx.connected;
+        this.netInfo = Object.assign({}, this.netInfo, {
+            hostname: ctx.hostname || this.netInfo.hostname || '',
+            ip: window.location.hostname || this.netInfo.ip || ''
+        });
+        this.fillCopyFields();
+        this.refreshConnTip();
+        if (typeof ui !== 'undefined') ui.updateWelcomeChecklist();
+    }
     updateStatusBadge(settings) {
-        const options = document.querySelectorAll('.opt-badge');
-        if (!options.length) return;
-        const connType = parseInt(settings.connType);
-        let activeType = "wifi";
+        const connType = parseInt(settings && settings.connType, 10);
+        let activeType = 'wifi';
         if (connType >= 2) {
-            const boardType = (settings.ethernet && settings.ethernet.boardType !== undefined) ? parseInt(settings.ethernet.boardType) : 0;
-            const pwrPin = (settings.ethernet && settings.ethernet.PWRPin !== undefined) ? parseInt(settings.ethernet.PWRPin) : -1;
-            if (boardType === 1) {
-                activeType = "lan";
-            }
-            else if (pwrPin !== -1) {
-                activeType = "poe";
-            }
-            else {
-                activeType = "lan";
-            }
+            const boardType = (settings.ethernet && settings.ethernet.boardType !== undefined) ? parseInt(settings.ethernet.boardType, 10) : 0;
+            const pwrPin = (settings.ethernet && settings.ethernet.PWRPin !== undefined) ? parseInt(settings.ethernet.PWRPin, 10) : -1;
+            if (boardType === 1) activeType = 'lan';
+            else if (pwrPin !== -1) activeType = 'poe';
+            else activeType = 'lan';
         }
-        options.forEach(opt => {
+        this.connKind = activeType;
+        if (settings) {
+            this.netInfo = Object.assign({}, this.netInfo, {
+                kind: activeType,
+                hostname: settings.hostname || this.netInfo.hostname || '',
+                ip: (settings.ip && settings.ip.ip) || this.netInfo.ip || '',
+                gateway: (settings.ip && settings.ip.gateway) || this.netInfo.gateway || '',
+                ssid: (settings.wifi && settings.wifi.ssid) || this.netInfo.ssid || ''
+            });
+            this.fillCopyFields();
+        }
+        this.renderConnIndicator(activeType);
+        document.querySelectorAll('.opt-badge').forEach(opt => {
             opt.classList.toggle('active', opt.getAttribute('data-conn') === activeType);
         });
+    }
+    renderConnIndicator(kind, bars) {
+        const el = get('divConnIndicator');
+        if (!el) return;
+        const k = kind || this.connKind || 'wifi';
+        el.setAttribute('data-conn', k);
+        const use = el.querySelector('.wired-ico use');
+        if (use) use.setAttribute('href', k === 'poe' ? '#svg-poe' : '#svg-ethernet');
+        if (typeof bars === 'number') {
+            el.setAttribute('data-level', String(Math.max(0, Math.min(4, bars))));
+            el.setAttribute('data-state', bars > 0 ? 'online' : 'offline');
+        } else if (k === 'lan' || k === 'poe') {
+            el.setAttribute('data-level', this.linkUp ? '4' : '0');
+            el.setAttribute('data-state', this.linkUp ? 'online' : 'offline');
+        }
+        this.refreshConnTip();
+    }
+    setWifiBars(bars, online) {
+        const el = get('divConnIndicator');
+        if (!el) return;
+        const level = online ? Math.max(1, Math.min(4, bars)) : 0;
+        el.setAttribute('data-level', String(level));
+        el.setAttribute('data-state', online ? 'online' : 'offline');
+        this.refreshConnTip();
+    }
+    noteNetworkActivity(eventName) {
+        if (this.connKind !== 'lan' && this.connKind !== 'poe') return;
+        if (!this.linkUp) return;
+        if (eventName === 'memStatus' || eventName === 'wifiStrength') return;
+        const el = get('divConnIndicator');
+        if (!el) return;
+        el.classList.remove('is-rx');
+        void el.offsetWidth;
+        el.classList.add('is-rx');
+    }
+    fillCopyFields() {
+        const ip = (this.netInfo && this.netInfo.ip) || '';
+        const host = (this.netInfo && this.netInfo.hostname) || '';
+        const connIp = get('spanConnIp');
+        if (connIp) connIp.textContent = ip || '--';
+        document.querySelectorAll('.spanEthIp').forEach(el => { el.textContent = ip || '--'; });
+        document.querySelectorAll('.spanHostname').forEach(el => { el.textContent = host || '--'; });
+    }
+    refreshConnTip() {
+        const tip = get('divConnTip');
+        const el = get('divConnIndicator');
+        if (!tip || !el) return;
+        const info = this.netInfo || {};
+        const kind = this.connKind || 'wifi';
+        const addLine = (text, copy) => {
+            if (!text) return;
+            if (copy) {
+                const b = document.createElement('button');
+                b.type = 'button';
+                b.className = 'copyable tip-copy';
+                b.textContent = text;
+                tip.appendChild(b);
+            } else {
+                const d = document.createElement('span');
+                d.className = 'tip-line';
+                d.textContent = text;
+                tip.appendChild(d);
+            }
+        };
+        tip.replaceChildren();
+        if (kind === 'wifi') {
+            const online = el.getAttribute('data-state') === 'online';
+            addLine(online ? 'Wi‑Fi' : 'Wi‑Fi · not connected');
+            if (info.ssid) addLine(info.ssid, true);
+            if (online && typeof info.rssi === 'number' && info.rssi > -100) {
+                addLine(`${info.rssi} dBm · ch ${info.channel >= 0 ? info.channel : '--'}`);
+            }
+        } else {
+            const label = kind === 'poe' ? 'PoE' : 'LAN';
+            addLine(this.linkUp ? `${label} · linked` : `${label} · no link`);
+            if (this.linkUp && info.speed) {
+                addLine(`${info.speed} Mbps${info.duplex ? ' full-duplex' : ''}`);
+            }
+        }
+        if (info.hostname) addLine(info.hostname, true);
+        if (info.ip) addLine(info.ip, true);
+        else if (window.location.hostname) addLine(window.location.hostname, true);
+        if (info.gateway && kind === 'wifi') addLine(`Gateway ${info.gateway}`);
+        el.setAttribute('aria-label', (info.ssid || info.hostname || info.ip || 'Network'));
     }
     setConnectionType(isEthernet) {
         get('cbHardwired').checked = isEthernet;
@@ -2652,12 +3146,15 @@ class Wifi {
                 ui.serviceError(err);
             } else {
                 ui.successMessage(tr('MSG_SAVE_SUCCESS'));
+                this.refreshIpModeLabel(!!obj.dhcp);
                 console.log(response);
             }
         });
     }
     saveNetwork() {
         let pnl = get('divNetAdapter'), obj = ui.fromElement(pnl);
+        // IP fields live on the same Network page; save them via saveIPSettings only.
+        if (obj && Object.prototype.hasOwnProperty.call(obj, 'ip')) delete obj.ip;
         const eth = obj.ethernet;
         // Si la valeur extraite est NaN, vide ou "None", on la remet proprement à -1
         if (isNaN(eth.PWRPin) || eth.PWRPin === 'None' || eth.PWRPin === '') {
@@ -2763,7 +3260,7 @@ class Wifi {
         if (!strength) return;
 
         const ssid = strength.ssid || strength.name;
-        const sVal = parseInt(strength.strength);
+        const sVal = parseInt(strength.strength, 10);
         const elSSID = get('spanNetworkSSID');
         const elChan = get('spanNetworkChannel');
         const elStrength = get('spanNetworkStrength');
@@ -2778,12 +3275,21 @@ class Wifi {
         for (let i = 0; i <= 3; i++) {
             const part = get('wifi_' + i);
             if (part) {
-                if (i <= level) {
-                    part.classList.add('active');
-                } else {
-                    part.classList.remove('active');
-                }
+                if (i <= level) part.classList.add('active');
+                else part.classList.remove('active');
             }
+        }
+
+        const online = !!(ssid && ssid !== '' && level >= 0);
+        this.linkUp = online || ((this.connKind === 'lan' || this.connKind === 'poe') && this.linkUp);
+        if (typeof ui !== 'undefined') ui.updateWelcomeChecklist();
+        this.netInfo = Object.assign({}, this.netInfo, {
+            ssid: ssid || this.netInfo.ssid || '',
+            rssi: isNaN(sVal) ? -100 : sVal,
+            channel: isNaN(strength.channel) ? -1 : strength.channel
+        });
+        if ((this.connKind || 'wifi') === 'wifi') {
+            this.setWifiBars(online ? (level + 1) : 0, online);
         }
     }
     procEthernet(ethernet) {
@@ -2793,17 +3299,33 @@ class Wifi {
         const divWifi = get('divWiFiStrength');
         const spanSpeed = get('spanEthernetSpeed');
 
-        divStatus.style.display = ethernet.connected ? '' : 'none';
-        divWifi.style.display = ethernet.connected ? 'none' : '';
-        spanStatus.innerHTML = ethernet.connected ? 'Connected' : 'Disconnected';
-        spanStatus.style.color = ethernet.connected ? 'var(--accent-sucess)' : '';
-        spanSpeed.innerHTML = !ethernet.connected ? '--------' : `${ethernet.speed} Mbps ${ethernet.fullduplex ? 'Full-duplex' : 'Half-duplex'}`;
+        if (divStatus) divStatus.style.display = ethernet.connected ? '' : 'none';
+        if (divWifi) divWifi.style.display = ethernet.connected ? 'none' : '';
+        if (spanStatus) {
+            spanStatus.innerHTML = ethernet.connected ? 'Connected' : 'Disconnected';
+            spanStatus.style.color = ethernet.connected ? 'var(--accent-sucess)' : '';
+        }
+        if (spanSpeed) spanSpeed.innerHTML = !ethernet.connected ? '--------' : `${ethernet.speed} Mbps ${ethernet.fullduplex ? 'Full-duplex' : 'Half-duplex'}`;
+
+        this.linkUp = !!ethernet.connected;
+        if (typeof ui !== 'undefined') ui.updateWelcomeChecklist();
+        this.netInfo = Object.assign({}, this.netInfo, {
+            speed: parseInt(ethernet.speed, 10) || 0,
+            duplex: !!ethernet.fullduplex
+        });
+        if ((this.connKind || '') === 'lan' || (this.connKind || '') === 'poe') {
+            this.renderConnIndicator(this.connKind);
+            if (ethernet.connected) this.noteNetworkActivity('ethernet');
+        }
     }
 }
 var wifi = new Wifi();
 class Somfy {
     initialized = false;
     frames = [];
+    txFrames = [];
+    scenes = [];
+    schedules = [];
     isScanClosing = false;
     scanObserver = null;
     shadeTypes = [
@@ -2841,6 +3363,222 @@ class Somfy {
     init() {
         if (this.initialized) return;
         this.initialized = true;
+        this.ensureHomeCmdDelegation();
+    }
+    ensureHomeCmdDelegation() {
+        if (this._homeCmdDelegated) return;
+        this._homeCmdDelegated = true;
+        const shadeRoot = get('divShadeControls');
+        const groupRoot = get('divGroupControls');
+        if (shadeRoot) {
+            shadeRoot.addEventListener('mouseup', (e) => this._onShadeCmdMouseUp(e), true);
+            shadeRoot.addEventListener('mousedown', (e) => this._onShadeCmdMouseDown(e), true);
+            shadeRoot.addEventListener('touchstart', (e) => this._onShadeCmdTouchStart(e), { capture: true, passive: true });
+            shadeRoot.addEventListener('click', (e) => this._onShadeMoreClick(e), true);
+        }
+        if (groupRoot) {
+            groupRoot.addEventListener('click', (e) => this._onGroupCmdClick(e), true);
+        }
+    }
+    _shadeCmdBtn(e) {
+        const btn = e.target.closest('.cmd-button');
+        if (!btn || !btn.closest('#divShadeControls')) return null;
+        return btn;
+    }
+    _onShadeCmdMouseUp(event) {
+        const btn = this._shadeCmdBtn(event);
+        if (!btn) return;
+        let cmd = btn.getAttribute('data-cmd');
+        let shadeId = parseInt(btn.getAttribute('data-shadeid'), 10);
+        if (this.btnTimer) {
+            clearTimeout(this.btnTimer);
+            this.btnTimer = null;
+            if (new Date().getTime() - this.btnDown > 2000) event.preventDefault();
+            else this.sendCommand(shadeId, cmd);
+        }
+        else if (cmd === 'light') {
+            btn.setAttribute('data-on', !makeBool(btn.getAttribute('data-on')));
+        }
+        else if (cmd === 'sunflag') {
+            if (makeBool(btn.getAttribute('data-on')))
+                this.sendCommand(shadeId, 'flag');
+            else
+                this.sendCommand(shadeId, 'sunflag');
+        }
+        else this.sendCommand(shadeId, cmd);
+    }
+    _onShadeCmdMouseDown(event) {
+        const btn = this._shadeCmdBtn(event);
+        if (!btn) return;
+        if (this.btnTimer) {
+            clearTimeout(this.btnTimer);
+            this.btnTimer = null;
+        }
+        let elShade = btn.closest('div.somfyShadeCtl');
+        let cmd = btn.getAttribute('data-cmd');
+        let shadeId = parseInt(btn.getAttribute('data-shadeid'), 10);
+        this.btnDown = new Date().getTime();
+        if (cmd === 'my') {
+            if (parseInt(elShade.getAttribute('data-direction'), 10) === 0) {
+                this.btnTimer = setTimeout(() => {
+                    this.openSetMyPosition(shadeId);
+                }, 2000);
+            }
+        }
+        else if (cmd === 'light') return;
+        else if (cmd === 'sunflag') return;
+        else if (makeBool(elShade.getAttribute('data-tilt'))) {
+            this.btnTimer = setTimeout(() => {
+                this.sendTiltCommand(shadeId, cmd);
+            }, 2000);
+        }
+    }
+    _onShadeCmdTouchStart(event) {
+        const btn = this._shadeCmdBtn(event);
+        if (!btn) return;
+        if (this.btnTimer) {
+            clearTimeout(this.btnTimer);
+            this.btnTimer = null;
+        }
+        let elShade = btn.closest('div.somfyShadeCtl');
+        let cmd = btn.getAttribute('data-cmd');
+        let shadeId = parseInt(btn.getAttribute('data-shadeid'), 10);
+        this.btnDown = new Date().getTime();
+        if (parseInt(elShade.getAttribute('data-direction'), 10) === 0) {
+            if (cmd === 'my') {
+                this.btnTimer = setTimeout(() => {
+                    this.openSetMyPosition(shadeId);
+                }, 2000);
+            }
+            else if (makeBool(elShade.getAttribute('data-tilt'))) {
+                this.btnTimer = setTimeout(() => {
+                    this.sendTiltCommand(shadeId, cmd);
+                }, 2000);
+            }
+        }
+    }
+    _onShadeMoreClick(event) {
+        const more = event.target.closest('.shadectl-more');
+        if (!more || !more.closest('#divShadeControls')) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const shadeId = parseInt(more.getAttribute('data-shadeid'), 10);
+        this.openShadeOverflow(shadeId, more);
+    }
+    _onGroupCmdClick(event) {
+        const btn = event.target.closest('.cmd-button');
+        if (!btn || !btn.closest('#divGroupControls')) return;
+        let groupId = parseInt(btn.getAttribute('data-groupid'), 10);
+        let cmd = btn.getAttribute('data-cmd');
+        if (cmd === 'sunflag') {
+            if (makeBool(btn.getAttribute('data-on')))
+                this.sendGroupCommand(groupId, 'flag');
+            else
+                this.sendGroupCommand(groupId, 'sunflag');
+        }
+        else
+            this.sendGroupCommand(groupId, cmd);
+    }
+    closeShadeOverflow() {
+        const menu = get('divShadeOverflow');
+        if (menu) menu.remove();
+        if (this._overflowCloser) {
+            document.removeEventListener('click', this._overflowCloser, true);
+            this._overflowCloser = null;
+        }
+    }
+    openShadeOverflow(shadeId, anchor) {
+        this.closeShadeOverflow();
+        const shade = (this.shades || []).find(s => Number(s.shadeId) === Number(shadeId));
+        const pinned = this.getFavoriteIds().includes(Number(shadeId));
+        const myLabel = shade && shade.myPos >= 0
+            ? ((tr('HOME_QA_MY') || 'My') + ' ' + this.formatPosLabel(shade.myPos))
+            : (tr('SHADE_FAVORITE_POSITION') || 'Favorite');
+        const menu = document.createElement('div');
+        menu.id = 'divShadeOverflow';
+        menu.className = 'home-shade-overflow';
+        menu.innerHTML =
+            `<button type="button" data-act="cfg"><svg><use href="#svg-cfg"></use></svg><span>${tr('SHADE_CONFIGURE') || 'Configure'}</span></button>` +
+            `<button type="button" data-act="pin"><svg><use href="#svg-favori"></use></svg><span>${pinned ? (tr('HOME_UNPIN_FAVORITE') || 'Unpin') : (tr('HOME_PIN_FAVORITE') || 'Pin to Home')}</span></button>` +
+            `<button type="button" data-act="my"><svg><use href="#svg-my"></use></svg><span>${myLabel}</span></button>`;
+        document.body.appendChild(menu);
+        const r = anchor.getBoundingClientRect();
+        const mw = menu.offsetWidth || 168;
+        const mh = menu.offsetHeight || 140;
+        let left = Math.min(window.innerWidth - mw - 8, Math.max(8, r.right - mw));
+        let top = r.bottom + 6;
+        if (top + mh > window.innerHeight - 8) top = Math.max(8, r.top - mh - 6);
+        menu.style.left = `${left}px`;
+        menu.style.top = `${top}px`;
+        menu.addEventListener('click', (e) => {
+            const btn = e.target.closest('[data-act]');
+            if (!btn) return;
+            e.preventDefault();
+            e.stopPropagation();
+            const act = btn.getAttribute('data-act');
+            this.closeShadeOverflow();
+            if (act === 'cfg') this.configureShade(shadeId);
+            else if (act === 'pin') this.toggleFavorite(shadeId);
+            else if (act === 'my') this.openSetMyPosition(shadeId);
+        });
+        this._overflowCloser = (e) => {
+            if (menu.contains(e.target) || (anchor && anchor.contains(e.target))) return;
+            this.closeShadeOverflow();
+        };
+        setTimeout(() => document.addEventListener('click', this._overflowCloser, true), 0);
+    }
+    toggleHomeSearch(open) {
+        const wrap = get('divHomeSearchWrap');
+        const fld = get('fldHomeSearch');
+        if (!wrap) return;
+        if (open) {
+            wrap.classList.add('is-expanded');
+            if (fld) setTimeout(() => fld.focus(), 0);
+        } else {
+            wrap.classList.remove('is-expanded');
+        }
+    }
+    onHomeSearchBlur() {
+        const fld = get('fldHomeSearch');
+        if (fld && String(fld.value || '').trim()) return;
+        this.toggleHomeSearch(false);
+    }
+    // Drapery/gate SVGs open as --shade-position rises; roller/shutter SVGs close as it rises.
+    // API scale matches HA: 100% = open · 0% = closed (flipPosition only remaps numbers).
+    _iconOpensAtHighPosition(shadeType) {
+        return [2, 7, 8, 11, 12, 13, 14, 15, 16].includes(parseInt(shadeType, 10));
+    }
+    formatPosLabel(apiPos) {
+        const p = parseInt(apiPos, 10);
+        if (isNaN(p)) return '—';
+        if (p >= 100) return tr('POS_OPEN') || 'Open';
+        if (p <= 0) return tr('POS_CLOSED') || 'Closed';
+        return `${p}%`;
+    }
+    canSetPosition(shadeType) {
+        return ![5, 9, 10, 14, 15, 16].includes(parseInt(shadeType, 10));
+    }
+    dismissPositioners(animate = true) {
+        document.querySelectorAll('.shade-positioner').forEach(el => {
+            if (!animate) { el.remove(); return; }
+            el.classList.add('popup-slide-out');
+            setTimeout(() => el.remove(), 280);
+        });
+    }
+    // Map API position (100%=open · 0%=closed) onto SVG --shade-position.
+    // Do not re-apply flipPosition — API position is already transformed server-side.
+    iconVisualPosition(apiPos, _flipPosition, shadeType) {
+        let visual = parseInt(apiPos, 10);
+        if (isNaN(visual)) visual = 0;
+        // Roller/blind SVGs use high CSS var = closed; drapery uses high = open.
+        if (!this._iconOpensAtHighPosition(shadeType)) visual = 100 - visual;
+        return visual;
+    }
+    applyShadeIconPosition(el, apiPos, flipPosition, shadeType) {
+        if (!el) return;
+        const p = this.iconVisualPosition(apiPos, flipPosition, shadeType);
+        el.style.setProperty('--shade-position', p);
+        el.style.setProperty('--fpos', `${apiPos}%`);
     }
     initPins() {
         document
@@ -2940,6 +3678,23 @@ class Somfy {
         divS.style.display = target ? 'block' : 'none';
         divG.style.display = target ? 'none' : 'inline-block';
     }
+    setFwLibs(libs) {
+        const el = get('spanFwLibs');
+        if (!el) return;
+        if (!libs) {
+            el.textContent = 'CC1101 · ArduinoJson · AsyncWebServer';
+            return;
+        }
+        const parts = [];
+        if (libs.cc1101) parts.push(`CC1101 ${libs.cc1101}`);
+        if (libs.arduinojson) parts.push(`ArduinoJson ${libs.arduinojson}`);
+        if (libs.asyncwebserver) parts.push(`AsyncWebServer ${libs.asyncwebserver}`);
+        if (libs.asynctcp) parts.push(`AsyncTCP ${libs.asynctcp}`);
+        if (libs.websockets) parts.push(`WebSockets ${libs.websockets}`);
+        if (libs.pubsub) parts.push(`PubSubClient ${libs.pubsub}`);
+        if (libs.platform) parts.push(libs.platform);
+        if (parts.length) el.textContent = parts.join(' · ');
+    }
     async loadSomfy() {
         //console.trace("Appel à loadSomfy");
         getJSONSync('/controller', (err, somfy) => {
@@ -2947,9 +3702,17 @@ class Somfy {
                 console.log(err);
                 ui.serviceError(err);
             } else {
-                get('spanMaxRooms').innerText = (somfy.maxRooms - 2);
-                get('spanMaxShades').innerText = (somfy.maxShades - 2);
-                get('spanMaxGroups').innerText = (somfy.maxGroups - 2);
+                this.maxRooms = somfy.maxRooms;
+                this.maxShades = somfy.maxShades;
+                this.maxGroups = somfy.maxGroups;
+                this.maxGroupsUsable = Math.max(0, (somfy.maxGroups || 16) - 2);
+                get('spanMaxRooms').innerText = somfy.maxRooms;
+                get('spanMaxShades').innerText = somfy.maxShades;
+                get('spanMaxGroups').innerText = this.maxGroupsUsable;
+                this.maxFixedCodes = somfy.maxFixedCodes || 8;
+                if (get('spanMaxFixedCodes')) get('spanMaxFixedCodes').innerText = `(${tr('FC_MAX')} ${this.maxFixedCodes})`;
+                this.setFwLibs(somfy.libs);
+                this.transceiver = somfy.transceiver || this.transceiver;
 
                 ui.toElement(get('divTransceiverSettings'), somfy);
 
@@ -2964,33 +3727,26 @@ class Somfy {
                 }
 
                 const cbRadio = get('cbEnableRadio');
-                const txtStatus = get('divRadioEnableStatus');
-                const row = get('divRadioEnableColor');
-                const radioTab = document.querySelector('.tab-container span[data-grpid="divRadioSettings"]');
-                const updateRadioText = () => {
-                    const currentState = cbRadio.checked;
-                    const isActuallyEnabled = radioTab && !radioTab.classList.contains('radio-error');
-
-                    if (currentState === isActuallyEnabled) {
-                        txtStatus.textContent = currentState ? tr('RADIO_ENABLED') : tr('RADIO_DISABLED');
-                    } else {
-                        txtStatus.textContent = tr('RADIO_SAVE_REQUIRED');
-                    }
+                const cfg = somfy.transceiver && somfy.transceiver.config;
+                if (cbRadio && cfg) cbRadio.checked = makeBool(cfg.enabled);
+                this._radioInit = !!(cfg && cfg.radioInit);
+                this._radioEnabledSaved = !!(cbRadio && cbRadio.checked);
+                const syncRadioChrome = () => {
+                    this.syncRadioEnableUi(cbRadio, this._radioInit, this._radioEnabledSaved);
                 };
-                const isRadioInit = somfy.transceiver.config.radioInit;
-                const sideNote = get('barsideRadioDisable');
-                if (radioTab) {
-                    radioTab.classList.toggle('radio-error', !isRadioInit);
-                    if (sideNote) sideNote.style.display = isRadioInit ? 'none' : 'inline';
-                    row.classList.toggle('radioOn', !!isRadioInit);
+                if (cbRadio && !cbRadio.dataset.radioChromeBound) {
+                    cbRadio.dataset.radioChromeBound = '1';
+                    cbRadio.addEventListener('change', syncRadioChrome);
                 }
-                cbRadio.addEventListener('change', updateRadioText);
-                updateRadioText();
+                syncRadioChrome();
 
                 this.setRoomsList(somfy.rooms);
                 this.setShadesList(somfy.shades);
                 this.setGroupsList(somfy.groups);
                 this.setRepeaterList(somfy.repeaters);
+                this.setFixedCodesList(somfy.fixedCodes || []);
+                this.loadAutomation();
+                if (typeof ui !== 'undefined') ui.updateWelcomeChecklist();
                 if (typeof somfy.version !== 'undefined') {
                     firmware.procFwStatus(somfy.version);
                 }
@@ -3009,6 +3765,27 @@ class Somfy {
                 if (valSpan && valSpan.classList.contains('gpioRadio-val')) valSpan.textContent = `GPIO${newValue}`;
             }
         });
+    }
+    syncRadioEnableUi(cb, radioInit, savedEnabled) {
+        const on = !!(cb && cb.checked);
+        const initOk = !!radioInit;
+        const sw = cb && cb.closest('.switch');
+        if (sw) sw.classList.toggle('is-on', on);
+        const row = get('divRadioEnableColor');
+        if (row) row.classList.toggle('radioOn', on && initOk);
+        const radioTab = document.querySelector('.tab-container span[data-grpid="divRadioSettings"]');
+        const sideNote = get('barsideRadioDisable');
+        if (radioTab) radioTab.classList.toggle('radio-error', !initOk);
+        if (sideNote) sideNote.style.display = initOk ? 'none' : 'inline';
+        const txtStatus = get('divRadioEnableStatus');
+        if (!txtStatus) return;
+        if (typeof savedEnabled === 'boolean' && on !== savedEnabled) {
+            txtStatus.textContent = tr('RADIO_SAVE_REQUIRED');
+        } else if (on && !initOk) {
+            txtStatus.textContent = tr('RADIO_INIT_FAILED');
+        } else {
+            txtStatus.textContent = tr(on ? 'RADIO_ENABLED' : 'RADIO_DISABLED');
+        }
     }
     saveRadio() {
         let valid = true;
@@ -3074,17 +3851,11 @@ class Somfy {
                     ui.successMessage(tr('MSG_SAVE_SUCCESS'));
                     get('btnSaveRadio').classList.remove('disabled');
 
-                    const init = res.config.radioInit,
-                    tab = document.querySelector('.tab-container span[data-grpid="divRadioSettings"]'),
-                            sn = get('barsideRadioDisable'),
-                            cb = get('cbEnableRadio');
-
-                            if (tab) {
-                                tab.classList.toggle('radio-error', !init);
-                                if (sn) sn.style.display = init ? 'none' : 'inline';
-                                get('divRadioEnableColor').classList.toggle('radioOn', !!init);
-                            }
-                            get('divRadioEnableStatus').textContent = tr(cb.checked === init ? (cb.checked ? 'RADIO_ENABLED' : 'RADIO_DISABLED') : 'RADIO_SAVE_REQUIRED');
+                    const init = !!(res.config && res.config.radioInit);
+                    const cb = get('cbEnableRadio');
+                    this._radioInit = init;
+                    this._radioEnabledSaved = !!(cb && cb.checked);
+                    this.syncRadioEnableUi(cb, this._radioInit, this._radioEnabledSaved);
                 });
             };
             if (isM) {
@@ -3163,38 +3934,69 @@ class Somfy {
             div.id = 'divScanFrequency';
             div.className = 'inst-overlay';
             div.innerHTML = `
-            <div class="instructions-content">
+            <div class="instructions-content scanfreq-overlay">
             <div class="overlay-scroll-content">
-            ${overlayHeader('SCANFREQ_TITLE', 'SCANFREQ_DESC', 'icon-tabRadio')}
-            <div class="unibloc"><div>${tr("SCANFREQ_SCAN_DESC")}</div></div>
-            <div class="unibloc">
-            <div class="uniRow">
-            <div class="scanfreqRssiLeft"><div class="uniLabel">${tr("SCANFREQ_SCAN")}</div><div class="scanfreqValue"><span id="spanTestFreq">433.00</span> <span>${tr("MHZ")}</span></div></div>
-            <div class="scanfreqRssiRight"><div class="uniLabel">RSSI</div><div class="scanfreqValue"><span id="spanTestRSSI">----</span> <span>${tr("DBM")}</span></div></div>
+            ${overlayHeader('SCANFREQ_TITLE', 'SCANFREQ_DESC', 'svg-tabRadio')}
+            <p class="scanfreq-intro">${tr('SCANFREQ_SCAN_DESC')}</p>
+            <div id="divScanFreqStatus" class="scanfreq-status" style="display:none;"></div>
+            <div class="scanfreq-metrics">
+            <div class="scanfreq-metric">
+            <span class="scanfreq-metric-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><use href="#svg-tabRadio"></use></svg></span>
+            <div class="scanfreq-metric-copy">
+            <div class="scanfreq-metric-label">${tr('SCANFREQ_SCAN')}</div>
+            <div class="scanfreq-metric-value"><span id="spanTestFreq">433.00</span><span>${tr('MHZ')}</span></div>
+            <div class="scanfreq-metric-sub"><span id="spanTestRSSI">----</span> ${tr('DBM')}</div>
             </div>
-            <hr>
-            <div class="uniRow" style="justify-content:space-between;align-items:flex-end">
-            <div class="scanfreqRssiLeft"><div class="uniLabel">${tr("SCANFREQ_FREQUENCY")}</div><div class="scanfreqValueColor"><span id="spanBestFreq">---.--</span> <span>${tr("MHZ")}</span></div></div>
-            <div class="scanfreqRssiRight"><div class="uniLabel">RSSI</div><div class="scanfreqValueColor"><span id="spanBestRSSI">----</span> <span>${tr("DBM")}</span></div></div>
+            </div>
+            <div class="scanfreq-metric is-best">
+            <span class="scanfreq-metric-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><use href="#svg-succes"></use></svg></span>
+            <div class="scanfreq-metric-copy">
+            <div class="scanfreq-metric-label">${tr('SCANFREQ_FREQUENCY')}</div>
+            <div class="scanfreq-metric-value"><span id="spanBestFreq">---.--</span><span>${tr('MHZ')}</span></div>
+            <div class="scanfreq-metric-sub"><span id="spanBestRSSI">----</span> ${tr('DBM')}</div>
             </div>
             </div>
-            <div class="uniblocrRssiCanvas"><canvas id="rssiCanvas"></canvas></div>
-            <div class="button-container-col">
-            <button id="btnStopScanning" type="button" onclick="somfy.stopScanningFrequency(true)">${tr("BT_STOP_SCAN")}</button>
-            <div style="display:flex;gap:10px;width:100%">
-            <button id="btnRestartScanning" type="button" style="display:none" onclick="somfy.scanFrequency(true)">${tr("BT_START_SCAN")}</button>
-            <button id="btnCopyFrequency" type="button" style="display:none" onclick="somfy.setScannedFrequency()">${tr("BT_COPY_FREQUENCY")}</button>
             </div>
-            <button id="btnCloseScanning" line type="button" style="display:none" line>${tr("BT_CLOSE")}</button>
+            <div class="uniblocrRssiCanvas scanfreq-canvas"><canvas id="rssiCanvas"></canvas></div>
+            <div class="button-container-col scanfreq-actions">
+            <button id="btnStopScanning" type="button" onclick="somfy.stopScanningFrequency(true)">${tr('BT_STOP_SCAN')}</button>
+            <div class="scanfreq-actions-row">
+            <button id="btnRestartScanning" type="button" style="display:none" onclick="somfy.scanFrequency(true)">${tr('BT_START_SCAN')}</button>
+            <button id="btnSaveScannedFrequency" type="button" style="display:none" onclick="somfy.saveScannedFrequency()">${tr('BT_SAVE_FREQUENCY')}</button>
             </div>
-            <div class="unibloc scanfreqwhat">
-            <div><span>💡</span> ${tr('SCANFREQ_UNDERSTANDING_RSSI')}</div><p>${tr('SCANFREQ_RSSI_EXPLANATION')}</p>
+            <button id="btnCloseScanning" line type="button" style="display:none">${tr('BT_CLOSE')}</button>
+            </div>
+            <details class="scanfreq-help">
+            <summary>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><use href="#svg-info"></use></svg>
+            <span>${tr('SCANFREQ_UNDERSTANDING_RSSI')}</span>
+            <svg class="scanfreq-help-chevron" viewBox="0 0 24 24" aria-hidden="true"><use href="#svg-arrowDown"></use></svg>
+            </summary>
+            <p class="scanfreq-help-blurb">${tr('SCANFREQ_RSSI_EXPLANATION')}</p>
             <div class="scanfreqSignal">
-            <div class="success"><svg><use href=#svg-succes></use></svg><div><b>${tr('SCANFREQ_RSSI_EXCELLENT')}</b> <span>${tr('SCANFREQ_RSSI_EXCELLENT_DESC')}</span></div></div>
-            <div class="warning"><svg><use href=#svg-warning></use></svg><div><b>${tr('SCANFREQ_RSSI_WEAK')}</b> <span>${tr('SCANFREQ_RSSI_WEAK_DESC')}</span></div></div>
-            <div class="error"><svg><use href=#svg-error></use></svg><div><b>${tr('SCANFREQ_RSSI_NOISE')}</b> <span>${tr('SCANFREQ_RSSI_NOISE_DESC')}</span></div></div>
+            <div class="scanfreq-leg scanfreq-leg-good">
+            <span class="scanfreq-leg-dot" aria-hidden="true"></span>
+            <div class="scanfreq-leg-copy">
+            <b>${tr('SCANFREQ_RSSI_EXCELLENT')}</b>
+            <span>${tr('SCANFREQ_RSSI_EXCELLENT_DESC')}</span>
             </div>
             </div>
+            <div class="scanfreq-leg scanfreq-leg-mid">
+            <span class="scanfreq-leg-dot" aria-hidden="true"></span>
+            <div class="scanfreq-leg-copy">
+            <b>${tr('SCANFREQ_RSSI_WEAK')}</b>
+            <span>${tr('SCANFREQ_RSSI_WEAK_DESC')}</span>
+            </div>
+            </div>
+            <div class="scanfreq-leg scanfreq-leg-poor">
+            <span class="scanfreq-leg-dot" aria-hidden="true"></span>
+            <div class="scanfreq-leg-copy">
+            <b>${tr('SCANFREQ_RSSI_NOISE')}</b>
+            <span>${tr('SCANFREQ_RSSI_NOISE_DESC')}</span>
+            </div>
+            </div>
+            </div>
+            </details>
             </div>
             </div>`;
 
@@ -3260,19 +4062,37 @@ class Somfy {
             putJSONSync('/beginFrequencyScan', {}, (err) => {
                 if (!err) {
                     ['btnStopScanning'].forEach(id => get(id).style.display = '');
-                    ['btnRestartScanning', 'btnCopyFrequency', 'btnCloseScanning'].forEach(id => get(id).style.display = 'none');
+                    ['btnRestartScanning', 'btnSaveScannedFrequency', 'btnCloseScanning'].forEach(id => {
+                        const el = get(id);
+                        if (el) el.style.display = 'none';
+                    });
+                    const status = get('divScanFreqStatus');
+                    if (status) {
+                        status.style.display = 'none';
+                        status.textContent = '';
+                    }
+                    div.removeAttribute('data-applied');
+                    div.removeAttribute('data-frequency');
                 }
             });
         }
         return div;
     }
     setScannedFrequency() {
-        let div = get('divScanFrequency');
-        let freq = parseFloat(div.getAttribute('data-frequency'));
-        let slid = get('slidFrequency');
+        if (!this.applyScannedFrequency()) return;
+        closeOverlay(get('divScanFrequency'));
+    }
+    applyScannedFrequency() {
+        const div = get('divScanFrequency');
+        if (!div) return null;
+        const freq = parseFloat(div.getAttribute('data-frequency'));
+        if (typeof freq !== 'number' || isNaN(freq) || freq <= 0) return null;
+        const slid = get('slidFrequency');
+        if (!slid) return null;
         slid.value = Math.round(freq * 1000);
-        somfy.frequencyChanged(slid);
-        closeOverlay(div);
+        this.frequencyChanged(slid);
+        div.setAttribute('data-applied', '1');
+        return freq;
     }
     stopScanningFrequency(killScan) {
         let div = get('divScanFrequency');
@@ -3285,17 +4105,41 @@ class Somfy {
             if (err) {
                 ui.serviceError(err);
             } else {
-                let freqAttr = div.getAttribute('data-frequency');
-                let freq = parseFloat(freqAttr);
-
                 get('btnStopScanning').style.display = 'none';
                 get('btnRestartScanning').style.display = '';
-                if (typeof freq === 'number' && !isNaN(freq) && freq > 0) {
-                    get('btnCopyFrequency').style.display = '';
-                }
                 get('btnCloseScanning').style.display = '';
+
+                const applied = this.applyScannedFrequency();
+                const status = get('divScanFreqStatus');
+                const saveBtn = get('btnSaveScannedFrequency');
+                if (applied != null) {
+                    if (saveBtn) saveBtn.style.display = '';
+                    if (status) {
+                        status.style.display = '';
+                        status.textContent = tr('SCANFREQ_APPLIED')
+                            .replace('%1', applied.fmt('###.00'))
+                            .replace('%2', tr('MHZ') || 'MHz');
+                    }
+                    ui.successMessage(tr('SCANFREQ_APPLIED_TOAST')
+                        .replace('%1', applied.fmt('###.00'))
+                        .replace('%2', tr('MHZ') || 'MHz'));
+                } else {
+                    if (saveBtn) saveBtn.style.display = 'none';
+                    if (status) {
+                        status.style.display = '';
+                        status.textContent = tr('SCANFREQ_NO_RESULT');
+                    }
+                }
             }
         });
+    }
+    saveScannedFrequency() {
+        const div = get('divScanFrequency');
+        if (!this.applyScannedFrequency() && !(div && div.getAttribute('data-applied') === '1')) {
+            return ui.errorMessage(get('divTransceiverSettings') || document.body, tr('SCANFREQ_NO_RESULT'));
+        }
+        if (div) closeOverlay(div);
+        this.saveRadio();
     }
     terminateScanUI(killScan) {
         this.isScanClosing = true;
@@ -3365,8 +4209,6 @@ class Somfy {
         const divHomePnl = getEl('divHomePnl');
         if (!divShadeControls || !divGroupControls) return;
 
-        const activePill = document.querySelector('.room-pill.active');
-        const currentRoomId = activePill ? parseInt(activePill.getAttribute('data-roomid'), 10) : 0;
         const isConfigOpen = divConfigPnl && divConfigPnl.style.display !== 'none';
 
         const shades = divShadeControls.querySelectorAll('.somfyShadeCtl');
@@ -3381,24 +4223,31 @@ class Somfy {
         const divRepeatList = getEl('divRepeatList');
         togglePair(divRepeatList && divRepeatList.children.length > 0, 'divRepeaterEmptyState', 'divRepeaterListContent');
 
+        const divFixedCodeList = getEl('divFixedCodeList');
+        togglePair(divFixedCodeList && divFixedCodeList.children.length > 0, 'divFixedCodeEmptyState', 'divFixedCodeListContent');
+
         let visibleShadesCount = 0, visibleGroupsCount = 0;
-        shades.forEach(el => { if (currentRoomId === 0 || parseInt(el.getAttribute('data-roomid'), 10) === currentRoomId) visibleShadesCount++; });
-        groups.forEach(el => { if (currentRoomId === 0 || parseInt(el.getAttribute('data-roomid'), 10) === currentRoomId) visibleGroupsCount++; });
+        shades.forEach(el => { if (!el.classList.contains('is-filtered-out')) visibleShadesCount++; });
+        groups.forEach(el => { if (!el.classList.contains('is-filtered-out')) visibleGroupsCount++; });
         const visibleCount = visibleShadesCount + visibleGroupsCount;
         const showLogoHeader = getEl('showLogoHeader');
         if (showLogoHeader) {
             showLogoHeader.style.visibility = (isConfigOpen || totalDevices > 0 || hasRooms) ? 'visible' : 'hidden';
         }
-        if (divHomePnl) divHomePnl.style.display = isConfigOpen ? 'none' : '';
+        const welcome = totalDevices === 0 && !hasRooms;
+        document.documentElement.classList.toggle('welcome-empty', !!(welcome && !isConfigOpen));
+        if (divHomePnl) divHomePnl.style.display = (isConfigOpen || welcome) ? 'none' : '';
+        this._syncHomeScenesVisibility();
 
         const divGetStarted = getEl('divGetStarted');
         const divNoDevice = getEl('divNoDevice');
 
-        if (totalDevices === 0 && !hasRooms) {
+        if (welcome) {
             setDisp(divGetStarted, !isConfigOpen, 'flex');
             setDisp(divNoDevice, false);
             setDisp(divShadeControls, false);
             setDisp(divGroupControls, false);
+            if (typeof ui !== 'undefined') ui.updateWelcomeChecklist();
         } else {
             setDisp(divGetStarted, false);
             setDisp(divNoDevice, visibleCount === 0 && !isConfigOpen, 'flex');
@@ -3425,7 +4274,7 @@ class Somfy {
         if (room.roomId === 0) return;
         let r = _rooms.find(x => x.roomId === room.roomId);
         if (typeof r !== 'undefined' && r.roomId === room.roomId) {
-            _rooms = _rooms.filter(x => x.roomId === room.roomId);
+            _rooms = _rooms.filter(x => x.roomId !== room.roomId);
             _rooms.sort((a, b) => { return a.sortOrder - b.sortOrder });
             this.setRoomsList(_rooms);
             this.checkEmptyState();
@@ -3452,15 +4301,318 @@ class Somfy {
             const pId = parseInt(pill.getAttribute('data-roomid'), 10);
             pill.classList.toggle('active', pId === roomId);
         });
-
-        const ctls = document.querySelectorAll('.somfyShadeCtl');
-        ctls.forEach(x => {
-            const rId = parseInt(x.getAttribute('data-roomid'), 10);
-            x.style.display = (roomId === 0 || rId === roomId) ? '' : 'none';
-        });
+        const stage = get('divHomeCards');
+        if (stage) {
+            stage.classList.remove('is-switching');
+            void stage.offsetWidth;
+            stage.classList.add('is-switching');
+        }
+        const rs = get('divRoomSelector');
+        if (rs) rs.setAttribute('data-roomid', String(roomId));
+        try { localStorage.setItem('espsomfyLastRoom', String(roomId)); } catch (_) {}
+        this.applyHomeFilter();
+        this.refreshHomeChrome();
         this.checkEmptyState();
     }
+    filterHome(q) {
+        this._homeQuery = String(q || '').trim().toLowerCase();
+        this.applyHomeFilter();
+        this.checkEmptyState();
+    }
+    applyHomeFilter() {
+        const q = this._homeQuery || '';
+        const roomId = this.currentRoomId();
+        const match = el => {
+            const rId = parseInt(el.getAttribute('data-roomid'), 10);
+            const roomOk = roomId === 0 || rId === roomId;
+            if (!q) return roomOk;
+            const name = ((el.querySelector('.shadectl-name, .groupctl-name') || {}).textContent || '').toLowerCase();
+            const room = ((el.querySelector('.shadectl-room, .groupctl-room') || {}).textContent || '').toLowerCase();
+            return roomOk && (name.indexOf(q) >= 0 || room.indexOf(q) >= 0);
+        };
+        document.querySelectorAll('.somfyShadeCtl').forEach(el => { el.classList.toggle('is-filtered-out', !match(el)); });
+        document.querySelectorAll('.somfyGroupCtl').forEach(el => { el.classList.toggle('is-filtered-out', !match(el)); });
+    }
+    currentRoomId() {
+        const active = document.querySelector('.room-pill.active');
+        if (active) return parseInt(active.getAttribute('data-roomid'), 10) || 0;
+        const rs = get('divRoomSelector');
+        return rs ? (parseInt(rs.getAttribute('data-roomid'), 10) || 0) : 0;
+    }
+    refreshHomeChrome() {
+        const roomId = this.currentRoomId();
+        const room = (typeof _rooms !== 'undefined' ? _rooms : []).find(r => Number(r.roomId) === roomId);
+        const name = room ? (room.name || (tr('HOME') || 'All')) : (tr('HOME') || 'All');
+        const el = get('spanHomeRoomTitle');
+        if (el) el.textContent = name;
+        this.renderHomeFavorites();
+        this.renderHomeScenes();
+        this.refreshMeshGlance();
+    }
+    roomQuickAction(command) {
+        putJSON('/roomCommand', { roomId: this.currentRoomId(), command }, (err) => {
+            if (err) ui.serviceError(err);
+        });
+    }
+    _shadeCount() {
+        if (Array.isArray(this.shades)) return this.shades.length;
+        const el = get('divShadeControls');
+        return el ? el.querySelectorAll('.somfyShadeCtl').length : 0;
+    }
+    _syncHomeScenesVisibility() {
+        const wrap = get('divHomeScenes');
+        if (wrap) wrap.style.display = (this._autoOk && this._shadeCount() > 0) ? '' : 'none';
+    }
+    loadAutomation() {
+        getJSON('/scenes', (err, data) => {
+            this._autoOk = !err && data && Array.isArray(data.scenes);
+            this.scenes = this._autoOk ? data.scenes : [];
+            this._syncHomeScenesVisibility();
+            this.renderHomeScenes();
+        });
+        getJSON('/schedules', (err, data) => {
+            this.schedules = (!err && data && Array.isArray(data.schedules)) ? data.schedules : [];
+        });
+    }
+    renderHomeScenes() {
+        const list = get('divHomeScenesList');
+        if (!list) return;
+        const esc = s => String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+        const items = Array.isArray(this.scenes) ? this.scenes : [];
+        if (!items.length) {
+            list.innerHTML = `<span class="home-scene-empty">${esc(tr('SCHED_EMPTY'))}</span>`;
+            return;
+        }
+        list.innerHTML = items.map(sc => {
+            const room = (typeof _rooms !== 'undefined' ? _rooms : []).find(r => Number(r.roomId) === Number(sc.roomId));
+            return `<div class="home-fav-chip home-scene-chip" title="${esc(tr('HOME_SCENE_RUN'))}" onclick="somfy.runScene(${Number(sc.id)})"><span class="home-scene-x" title="${esc(tr('HOME_SCENE_DELETE'))}" onclick="event.stopPropagation(); somfy.deleteScene(${Number(sc.id)})">×</span><strong>${esc(sc.name)}</strong><span>${esc(room ? room.name : '')}</span></div>`;
+        }).join('');
+    }
+    runScene(id) {
+        putJSON('/sceneCommand', { id: Number(id) }, (err) => {
+            if (err) ui.serviceError(err);
+        });
+    }
+    deleteScene(id) {
+        putJSON('/scenes', { id: Number(id), delete: true }, (err) => {
+            if (err) return ui.serviceError(err);
+            this.loadAutomation();
+        });
+    }
+    saveSceneFromRoom() {
+        if (!this._autoOk) return ui.serviceError({ htmlError: 404, service: 'PUT /scenes', desc: 'Firmware v3.4.0 required' });
+        const roomId = this.currentRoomId();
+        const room = (typeof _rooms !== 'undefined' ? _rooms : []).find(r => Number(r.roomId) === roomId);
+        const defaultName = room && roomId ? `${room.name} ${tr('HOME_QA_MY') || 'My'}` : (tr('HOME_SCENES') || 'Scene');
+        const div = document.createElement('div');
+        div.className = 'inst-overlay';
+        div.innerHTML = `
+            <div class="instructions-content">
+            <div class="overlay-scroll-content">
+            ${overlayHeader('HOME_SCENE_SAVE', 'HOME_SCENE_NAME', 'svg-favori')}
+            <div class="unibloc">
+            <label class="label" for="fldSceneName">${tr('HOME_SCENE_NAME')}</label>
+            <input id="fldSceneName" class="inputAndSelect" type="text" maxlength="24" value="${String(defaultName).replace(/"/g, '')}" placeholder="${tr('HOME_SCENE_NAME_PH')}">
+            </div>
+            </div>
+            <div class="hrDivFooter"></div>
+            <div class="button-container-overlay">
+            <button type="button" id="btnSaveScene">${tr('HOME_SCENE_SAVE')}</button>
+            <button type="button" line id="btnCancelScene">${tr('BT_CANCEL_1')}</button>
+            </div>
+            </div>`;
+        shOverlay(div);
+        div.querySelector('#btnCancelScene').onclick = () => closeOverlay(div);
+        div.querySelector('#btnSaveScene').onclick = () => {
+            const name = (get('fldSceneName').value || '').trim() || defaultName;
+            const steps = (this.shades || []).filter(s => {
+                const t = Number(s.shadeType);
+                if (t === 9 || t === 10) return false;
+                return !roomId || Number(s.roomId) === roomId;
+            }).map(s => ({
+                shadeId: Number(s.shadeId),
+                pos: parseInt(s.position, 10) || 0,
+                tilt: (Number(s.tiltType) ? parseInt(s.tiltPosition, 10) : -1)
+            }));
+            putJSON('/scenes', { name, roomId, steps }, (err) => {
+                if (err) return ui.serviceError(err);
+                closeOverlay(div);
+                this.loadAutomation();
+            });
+        };
+        ui.setFocus(get('fldSceneName'), true);
+    }
+    openSchedules() {
+        getJSON('/schedules', (err, data) => {
+            if (err) return ui.serviceError(err);
+            this.schedules = (data && data.schedules) || [];
+            this._renderSchedulesOverlay();
+        });
+    }
+    _schedDayLabel(i) {
+        return ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'][i] || '';
+    }
+    _renderSchedulesOverlay() {
+        const existing = get('divSchedules');
+        if (existing) existing.remove();
+        const rooms = [{ roomId: 0, name: tr('SCHED_ALL_ROOMS') }].concat(typeof _rooms !== 'undefined' ? _rooms : []);
+        const scenes = this.scenes || [];
+        const cmdLabel = c => (c === 0 ? (tr('HOME_QA_OPEN')) : c === 2 ? (tr('HOME_QA_CLOSE')) : c === 3 ? 'Stop' : (tr('HOME_QA_MY')));
+        const esc = s => String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+        const rows = (this.schedules || []).map(t => {
+            const when = `${String(t.hour).padStart(2, '0')}:${String(t.minute).padStart(2, '0')}`;
+            const days = [0, 1, 2, 3, 4, 5, 6].filter(d => (Number(t.days) ? (t.days & (1 << d)) : 1)).map(d => this._schedDayLabel(d)).join('');
+            let target = '';
+            if (Number(t.kind) === 1) {
+                const sc = scenes.find(s => Number(s.id) === Number(t.target));
+                target = sc ? sc.name : `${tr('SCHED_SCENE')} ${t.target}`;
+            } else {
+                const rm = rooms.find(r => Number(r.roomId) === Number(t.target));
+                target = rm ? rm.name : `${tr('SCHED_ROOM')} ${t.target}`;
+            }
+            const extra = Number(t.kind) === 1 ? '' : ` · ${cmdLabel(t.cmd)}`;
+            return `<div class="unibloc sched-item" data-id="${t.id}">
+                <label class="toggle-row"><input type="checkbox" ${t.enabled ? 'checked' : ''} onchange="somfy.saveSchedule({id:${t.id}, enabled:this.checked})"><span>${when} ${esc(days)} — ${esc(target)}${esc(extra)}</span></label>
+                <button type="button" class="home-scene-x" onclick="somfy.saveSchedule({id:${t.id}, delete:true})">×</button>
+            </div>`;
+        }).join('');
+        const roomOpts = rooms.map(r => `<option value="${Number(r.roomId)}">${esc(r.name || '')}</option>`).join('');
+        const sceneOpts = scenes.map(s => `<option value="${Number(s.id)}">${esc(s.name)}</option>`).join('');
+        const dayBtns = [0, 1, 2, 3, 4, 5, 6].map(d => `<button type="button" class="sched-day on" data-day="${d}">${this._schedDayLabel(d)}</button>`).join('');
+        const div = document.createElement('div');
+        div.id = 'divSchedules';
+        div.className = 'inst-overlay';
+        div.innerHTML = `
+            <div class="instructions-content">
+            <div class="overlay-scroll-content">
+            ${overlayHeader('SCHED_TITLE', 'SCHED_DESC', 'svg-tabSystem')}
+            ${rows}
+            <div class="sched-form">
+            <span class="label">${tr('SCHED_TIME') || 'Time'}</span>
+            <div class="sched-row">
+            <input id="fldSchedHour" class="inputAndSelect" type="number" min="0" max="23" value="8" inputmode="numeric">
+            <span>:</span>
+            <input id="fldSchedMinute" class="inputAndSelect" type="number" min="0" max="59" value="0" inputmode="numeric">
+            </div>
+            <span class="label">${tr('SCHED_DAYS')}</span>
+            <div class="sched-row" id="divSchedDays">${dayBtns}</div>
+            <span class="label">${tr('SCHED_ADD')}</span>
+            <div class="sched-row">
+            <select id="selSchedKind" class="inputAndSelect" onchange="somfy._schedKindChanged()">
+            <option value="0">${tr('SCHED_ROOM')}</option>
+            <option value="1">${tr('SCHED_SCENE')}</option>
+            </select>
+            <select id="selSchedRoom" class="inputAndSelect">${roomOpts}</select>
+            <select id="selSchedScene" class="inputAndSelect" style="display:none">${sceneOpts}</select>
+            <select id="selSchedCmd" class="inputAndSelect">
+            <option value="0">${tr('HOME_QA_OPEN')}</option>
+            <option value="1">${tr('HOME_QA_MY')}</option>
+            <option value="2">${tr('HOME_QA_CLOSE')}</option>
+            </select>
+            </div>
+            </div>
+            </div>
+            <div class="hrDivFooter"></div>
+            <div class="button-container-overlay">
+            <button type="button" id="btnAddSched">${tr('SCHED_ADD')}</button>
+            <button type="button" line id="btnCloseSched">${tr('BT_CANCEL_1')}</button>
+            </div>
+            </div>`;
+        shOverlay(div);
+        div.querySelector('#btnCloseSched').onclick = () => closeOverlay(div);
+        div.querySelectorAll('#divSchedDays .sched-day').forEach(btn => {
+            btn.onclick = () => btn.classList.toggle('on');
+        });
+        div.querySelector('#btnAddSched').onclick = () => {
+            const kind = parseInt(get('selSchedKind').value, 10) || 0;
+            let days = 0;
+            div.querySelectorAll('#divSchedDays .sched-day.on').forEach(b => { days |= (1 << parseInt(b.getAttribute('data-day'), 10)); });
+            this.saveSchedule({
+                enabled: true,
+                hour: parseInt(get('fldSchedHour').value, 10) || 0,
+                minute: parseInt(get('fldSchedMinute').value, 10) || 0,
+                days,
+                kind,
+                target: kind === 1 ? parseInt(get('selSchedScene').value, 10) || 0 : parseInt(get('selSchedRoom').value, 10) || 0,
+                cmd: parseInt(get('selSchedCmd').value, 10) || 0
+            });
+        };
+        this._schedKindChanged();
+    }
+    _schedKindChanged() {
+        const kind = parseInt(get('selSchedKind')?.value, 10) || 0;
+        if (get('selSchedRoom')) get('selSchedRoom').style.display = kind === 1 ? 'none' : '';
+        if (get('selSchedScene')) get('selSchedScene').style.display = kind === 1 ? '' : 'none';
+        if (get('selSchedCmd')) get('selSchedCmd').style.display = kind === 1 ? 'none' : '';
+    }
+    saveSchedule(obj) {
+        putJSON('/schedules', obj, (err) => {
+            if (err) return ui.serviceError(err);
+            this.openSchedules();
+        });
+    }
+    favKey() { return 'espsomfyHomeFavorites'; }
+    getFavoriteIds() {
+        try {
+            const raw = JSON.parse(localStorage.getItem(this.favKey()) || '[]');
+            return Array.isArray(raw) ? raw.map(Number).filter(n => n > 0) : [];
+        } catch (_) { return []; }
+    }
+    toggleFavorite(shadeId) {
+        const id = Number(shadeId);
+        let ids = this.getFavoriteIds();
+        if (ids.includes(id)) ids = ids.filter(x => x !== id);
+        else ids.push(id);
+        localStorage.setItem(this.favKey(), JSON.stringify(ids.slice(0, 12)));
+        this.renderHomeFavorites();
+    }
+    renderHomeFavorites() {
+        const wrap = get('divHomeFavorites');
+        const list = get('divHomeFavoritesList');
+        if (!wrap || !list) return;
+        const ids = this.getFavoriteIds();
+        const shades = Array.isArray(this.shades) ? this.shades : [];
+        const items = ids.map(id => shades.find(s => Number(s.shadeId) === id)).filter(Boolean);
+        if (!items.length) {
+            wrap.style.display = 'none';
+            list.innerHTML = '';
+            return;
+        }
+        wrap.style.display = '';
+        const esc = s => String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+        list.innerHTML = items.map(s => {
+            const room = (typeof _rooms !== 'undefined' ? _rooms : []).find(r => Number(r.roomId) === Number(s.roomId));
+            return `<button type="button" class="home-fav-chip" title="${esc(tr('SHADE_FAVORITE_POSITION') || 'My')}" onclick="somfy.sendCommand(${Number(s.shadeId)}, 'my')"><strong>${esc(s.name)}</strong><span>${esc(room ? room.name : '')}</span></button>`;
+        }).join('');
+    }
+    refreshMeshGlance() {
+        // Mesh status lives in the top-bar icons (hover for details).
+    }
+    updateCapacityCounts() {
+        const fmt = (id, ...a) => {
+            let s = tr(id);
+            a.forEach((v, i) => { s = s.split('{' + i + '}').join(String(v)); });
+            return s;
+        };
+        const set = (key, n, max) => {
+            const left = Math.max(0, max - n);
+            const full = n >= max;
+            document.querySelectorAll(`.cap-count[data-cap="${key}"]`).forEach(el => {
+                el.textContent = `${n}/${max}`;
+                el.title = fmt('CAP_LEFT', left);
+                el.classList.toggle('cap-full', full);
+            });
+            document.querySelectorAll(`.cap-line[data-cap="${key}"]`).forEach(el => {
+                el.textContent = `${fmt('CAP_OF', n, max)} · ${fmt('CAP_LEFT', left)}`;
+                el.classList.toggle('cap-full', full);
+            });
+        };
+        set('rooms', (this.rooms || []).filter(r => r.roomId).length, this.maxRooms || 24);
+        set('shades', (this.shades || []).length, this.maxShades || 48);
+        set('groups', (this.groups || []).length, this.maxGroupsUsable || 14);
+    }
     setRoomsList(rooms) {
+        this.rooms = rooms || [];
         let divCfg = '';
         const homeName = tr('HOME');
         const slider = get('divRoomSelector');
@@ -3487,7 +4639,8 @@ class Somfy {
         slider.style.display = 'flex';
 
         const navContainer = document.querySelector('.room-nav-container');
-        if(navContainer) navContainer.style.display = rooms.length === 0 ? 'none' : 'flex';
+        // Keep the room bar visible for the shade view toggle even with zero rooms.
+        if (navContainer) navContainer.style.display = 'flex';
 
         get('divRoomList').innerHTML = divCfg;
         get('selShadeRoom').innerHTML = divOpts;
@@ -3504,6 +4657,11 @@ class Somfy {
             });
         });
         this.initRoomScroll(slider);
+        this.updateCapacityCounts();
+        let last = 0;
+        try { last = parseInt(localStorage.getItem('espsomfyLastRoom') || '0', 10) || 0; } catch (_) { last = 0; }
+        if (last && _rooms.some(r => Number(r.roomId) === last)) this.selectRoom(last);
+        else this.applyHomeFilter();
     }
     initRoomScroll(c) {
         const update = () => {
@@ -3554,13 +4712,342 @@ class Somfy {
         get('divRepeatList').innerHTML = divCfg;
         this.checkEmptyState();
     }
+    setFixedCodesList(list) {
+        this.fixedCodes = Array.isArray(list) ? list : [];
+        const el = get('divFixedCodeList');
+        if (!el) return;
+        let html = '';
+        for (let i = 0; i < this.fixedCodes.length; i++) {
+            const sw = this.fixedCodes[i];
+            const ready = !!sw.ready;
+            html += `<div class="somfyShade" data-fcid="${sw.id}">
+                <div class="shade-name"><div class="name-text">${sw.name || ('RF Switch ' + sw.id)}</div>
+                <div class="cfg-room">${sw.frequency} MHz · ${ready ? tr('FC_LEARNED') : tr('FC_NOT_LEARNED')}</div></div>
+                <div class="uniRight" style="display:flex;gap:6px;align-items:center;">
+                    <button type="button" class="button-outline" ${ready ? '' : 'disabled'} onclick="somfy.commandFixedCode(${sw.id},'off');">${tr('FC_OFF')}</button>
+                    <button type="button" ${ready ? '' : 'disabled'} onclick="somfy.commandFixedCode(${sw.id},'on');">${tr('FC_ON')}</button>
+                    <span class="switch"><input type="checkbox" ${sw.state ? 'checked' : ''} ${ready ? '' : 'disabled'} onchange="somfy.commandFixedCode(${sw.id}, this.checked ? 'on' : 'off');"><div></div></span>
+                    <div class="divEditDelete-svg" onclick="somfy.openEditFixedCode(${sw.id});"><svg class="icon-svg"><use href=#svg-edit></use></svg></div>
+                    <div class="divEditDelete-svg" onclick="somfy.deleteFixedCode(${sw.id});"><svg class="icon-svg"><use href=#svg-close></use></svg></div>
+                </div>
+            </div>`;
+        }
+        el.innerHTML = html;
+        this.checkEmptyState();
+    }
+    showEditFixedCode(show) {
+        if (!show && this._fcLearning) this.cancelFixedCodeLearn();
+        const list = get('divFixedCodeListContainer');
+        const edit = get('divEditFixedCode');
+        if (!list || !edit) return;
+        list.style.display = show ? 'none' : '';
+        edit.style.display = show ? 'block' : 'none';
+        const banner = get('divFixedCodeLearnBanner');
+        if (banner) banner.style.display = 'none';
+        if (!show) {
+            this._setFixedCodeLearning(false);
+            this._fcSessionCreated = false;
+        }
+    }
+    cancelEditFixedCode() {
+        if (this._fcLearning) this.cancelFixedCodeLearn();
+        const id = parseInt(get('fldFixedCodeId').value || '0', 10);
+        // Discard empty draft created only for learn/save in this session
+        if (id && this._fcSessionCreated) {
+            const sw = (this.fixedCodes || []).find(x => x.id === id);
+            if (sw && !sw.ready && !sw.hasOn && !sw.hasOff) {
+                putJSONSync('/deleteFixedCode', { id: id }, () => {
+                    this.setFixedCodesList((this.fixedCodes || []).filter(x => x.id !== id));
+                });
+            }
+        }
+        this.showEditFixedCode(false);
+    }
+    openEditFixedCode(id) {
+        const isNew = id === undefined || id === null || id === '';
+        if (isNew && (this.fixedCodes || []).length >= (this.maxFixedCodes || 8)) {
+            return ui.errorMessage(get('divSomfySettings') || get('divFixedCodes'), tr('ERR_DEVICE_LIMIT_REACHED') || 'Maximum RF switches reached');
+        }
+        this._fcSessionCreated = false;
+        this.showEditFixedCode(true);
+        if (isNew) {
+            // Draft only — create on first Save or Learn (avoids orphan duplicates)
+            this._populateFixedCodeForm(null);
+            return;
+        }
+        const sw = (this.fixedCodes || []).find(x => x.id === id);
+        this._populateFixedCodeForm(sw || { id: id });
+    }
+    _populateFixedCodeForm(sw) {
+        const setVal = (elId, val) => { const el = get(elId); if (el) el.value = val; };
+        const setTxt = (elId, val) => { const el = get(elId); if (el) el.textContent = val; };
+        setVal('fldFixedCodeId', sw ? sw.id : 0);
+        setVal('fldFixedCodeName', sw ? (sw.name || '') : '');
+        setVal('fldFixedCodeFreq', sw ? sw.frequency : 433.92);
+        setVal('fldFixedCodeRepeats', sw ? sw.repeats : 5);
+        const cb = get('cbFixedCodeSingleButton');
+        if (cb) cb.checked = !!(sw && sw.singleButton);
+        const cbFlip = get('cbFixedCodeFlipCommands');
+        if (cbFlip) cbFlip.checked = !!(sw && sw.flipCommands);
+        setTxt('divFixedCodeOnStatus', sw && sw.hasOn ? tr('FC_LEARNED') : tr('FC_NOT_LEARNED'));
+        setTxt('divFixedCodeOffStatus', sw && sw.hasOff ? tr('FC_LEARNED') : tr('FC_NOT_LEARNED'));
+        this._setFixedCodeDetails(sw);
+        this.onFixedCodeSingleButtonChanged();
+        this._updateFixedCodeTestButtons(sw);
+        this._setFixedCodeLearning(false);
+        const result = get('divFixedCodeLearnResult');
+        if (result) { result.style.display = 'none'; result.textContent = ''; }
+        const nameEl = get('fldFixedCodeName');
+        if (nameEl) setTimeout(() => nameEl.focus(), 50);
+    }
+    onFixedCodeSingleButtonChanged() {
+        const single = !!(get('cbFixedCodeSingleButton') && get('cbFixedCodeSingleButton').checked);
+        const offRow = get('divFixedCodeLearnOffRow');
+        if (offRow) offRow.style.display = single ? 'none' : '';
+        const onLabel = get('lblFixedCodeLearnOn');
+        if (onLabel) onLabel.textContent = single ? tr('FC_LEARN_CODE') : tr('FC_LEARN_ON');
+        const id = parseInt(get('fldFixedCodeId').value || '0', 10);
+        const sw = id ? (this.fixedCodes || []).find(x => x.id === id) : null;
+        this._updateFixedCodeTestButtons(sw);
+    }
+    _updateFixedCodeTestButtons(sw) {
+        const row = get('divFixedCodeTestRow');
+        const btnOn = get('btnFixedCodeTestOn');
+        const btnOff = get('btnFixedCodeTestOff');
+        if (!row) return;
+        const hasOn = !!(sw && sw.hasOn);
+        const hasOff = !!(sw && (sw.hasOff || (sw.singleButton && sw.hasOn)));
+        const single = !!(sw && sw.singleButton) || !!(get('cbFixedCodeSingleButton') && get('cbFixedCodeSingleButton').checked);
+        row.style.display = (hasOn || hasOff) ? '' : 'none';
+        if (btnOn) {
+            btnOn.style.display = hasOn ? '' : 'none';
+            btnOn.disabled = !hasOn || !!this._fcLearning;
+            btnOn.textContent = single ? tr('FC_TEST') : tr('FC_ON');
+        }
+        if (btnOff) {
+            btnOff.style.display = (!single && hasOff) ? '' : 'none';
+            btnOff.disabled = !hasOff || !!this._fcLearning;
+        }
+    }
+    _setFixedCodeLearning(busy) {
+        this._fcLearning = !!busy;
+        const disable = !!busy;
+        const ids = ['btnSaveFixedCode', 'btnCancelFixedCode', 'btnFixedCodeLearnOn', 'btnFixedCodeLearnOff',
+            'fldFixedCodeName', 'fldFixedCodeFreq', 'fldFixedCodeRepeats', 'cbFixedCodeSingleButton',
+            'cbFixedCodeFlipCommands', 'btnFixedCodeTestOn', 'btnFixedCodeTestOff'];
+        for (let i = 0; i < ids.length; i++) {
+            const el = get(ids[i]);
+            if (el) el.disabled = disable;
+        }
+    }
+    _fixedCodeFormPayload() {
+        return {
+            name: get('fldFixedCodeName').value || '',
+            frequency: parseFloat(get('fldFixedCodeFreq').value || '433.92'),
+            repeats: parseInt(get('fldFixedCodeRepeats').value || '5', 10),
+            singleButton: !!(get('cbFixedCodeSingleButton') && get('cbFixedCodeSingleButton').checked),
+            flipCommands: !!(get('cbFixedCodeFlipCommands') && get('cbFixedCodeFlipCommands').checked)
+        };
+    }
+    _ensureFixedCodeId(done) {
+        const id = parseInt(get('fldFixedCodeId').value || '0', 10);
+        if (id > 0) return done(null, id);
+        putJSONSync('/addFixedCode', this._fixedCodeFormPayload(), (err, sw) => {
+            if (err) return done(err);
+            this._fcSessionCreated = true;
+            const list = this.fixedCodes || [];
+            if (!list.find(x => x.id === sw.id)) list.push(sw);
+            else {
+                const idx = list.findIndex(x => x.id === sw.id);
+                list[idx] = sw;
+            }
+            this.fixedCodes = list;
+            get('fldFixedCodeId').value = sw.id;
+            done(null, sw.id, sw);
+        });
+    }
+    _setFixedCodeDetails(sw) {
+        const onCode = get('divFixedCodeOnCode');
+        const offCode = get('divFixedCodeOffCode');
+        if (onCode) {
+            onCode.textContent = (sw && sw.hasOn)
+                ? tr('FC_LEARNED_CODE').replace('%s', sw.onCode || '').replace('%s', String(sw.onCount || 0)) + (sw.onPreview ? `\n${sw.onPreview}` : '')
+                : '';
+        }
+        if (offCode) {
+            offCode.textContent = (sw && sw.hasOff)
+                ? tr('FC_LEARNED_CODE').replace('%s', sw.offCode || '').replace('%s', String(sw.offCount || 0)) + (sw.offPreview ? `\n${sw.offPreview}` : '')
+                : '';
+        }
+    }
+    saveFixedCode() {
+        if (this._fcLearning) return ui.errorMessage(get('divEditFixedCode'), tr('FC_BUSY_LEARNING'));
+        const id = parseInt(get('fldFixedCodeId').value || '0', 10);
+        const obj = Object.assign(id > 0 ? { id: id } : {}, this._fixedCodeFormPayload());
+        // New draft → add once. Existing → save. Never both.
+        const url = id > 0 ? '/saveFixedCode' : '/addFixedCode';
+        putJSONSync(url, obj, (err, sw) => {
+            if (err) return ui.serviceError(err);
+            this._fcSessionCreated = false;
+            const list = this.fixedCodes || [];
+            const idx = list.findIndex(x => x.id === sw.id);
+            if (idx >= 0) list[idx] = sw; else list.push(sw);
+            this.setFixedCodesList(list);
+            this.showEditFixedCode(false);
+        });
+    }
+    deleteFixedCode(id) {
+        if (!confirm(tr('FC_DELETE_CONFIRM'))) return;
+        putJSONSync('/deleteFixedCode', { id: id }, (err) => {
+            if (err) return ui.serviceError(err);
+            this.setFixedCodesList((this.fixedCodes || []).filter(x => x.id !== id));
+        });
+    }
+    _fixedCodeCommandError(err) {
+        if (err && (err.htmlError === 429 || err.status === 429 || err.cmdStatus === 'rate_limited' ||
+            (typeof err === 'string' && err.indexOf('rate_limited') >= 0))) {
+            return ui.errorToast(tr('FC_RATE_LIMITED'));
+        }
+        return ui.serviceError(err);
+    }
+    commandFixedCode(id, state) {
+        putJSON('/fixedCodeCommand', { id: id, state: state }, (err, sw) => {
+            if (err) return this._fixedCodeCommandError(err);
+            this.procFixedCodeState(sw);
+        });
+    }
+    testFixedCode(state) {
+        if (this._fcLearning) return;
+        const id = parseInt(get('fldFixedCodeId').value || '0', 10);
+        if (!id) return;
+        const single = !!(get('cbFixedCodeSingleButton') && get('cbFixedCodeSingleButton').checked);
+        putJSON('/fixedCodeCommand', { id: id, state: single ? 'toggle' : state }, (err, sw) => {
+            if (err) return this._fixedCodeCommandError(err);
+            this.procFixedCodeState(sw);
+        });
+    }
+    learnFixedCode(button) {
+        if (this._fcLearning) return;
+        this._ensureFixedCodeId((err, id) => {
+            if (err) return ui.serviceError(err);
+            const single = !!(get('cbFixedCodeSingleButton') && get('cbFixedCodeSingleButton').checked);
+            putJSONSync('/saveFixedCode', Object.assign({ id: id }, this._fixedCodeFormPayload()), (err2) => {
+                if (err2) return ui.serviceError(err2);
+                this._startFixedLearn(id, single ? 'on' : button);
+            });
+        });
+    }
+    _startFixedLearn(id, button) {
+        const banner = get('divFixedCodeLearnBanner');
+        const progress = get('divFixedCodeLearnProgress');
+        const result = get('divFixedCodeLearnResult');
+        if (result) { result.style.display = 'none'; result.textContent = ''; }
+        const testRow = get('divFixedCodeTestRow');
+        if (testRow) testRow.style.display = 'none';
+        if (banner) banner.style.display = '';
+        if (progress) progress.textContent = tr('FC_LEARN_PROGRESS').replace('%s', '0').replace('%s', '--');
+        this._setFixedCodeLearning(true);
+        putJSONSync('/fixedCodeLearn', { id: id, button: button, action: 'start' }, (err) => {
+            if (err) {
+                this._setFixedCodeLearning(false);
+                if (banner) banner.style.display = 'none';
+                return ui.serviceError(err);
+            }
+        });
+    }
+    cancelFixedCodeLearn() {
+        putJSONSync('/fixedCodeLearn', { action: 'cancel' }, () => {});
+        const banner = get('divFixedCodeLearnBanner');
+        if (banner) banner.style.display = 'none';
+        this._setFixedCodeLearning(false);
+        const id = parseInt(get('fldFixedCodeId').value || '0', 10);
+        const sw = id ? (this.fixedCodes || []).find(x => x.id === id) : null;
+        this._updateFixedCodeTestButtons(sw);
+    }
+    procFixedCodeState(sw) {
+        if (!sw || !sw.id) return;
+        const list = this.fixedCodes || [];
+        const idx = list.findIndex(x => x.id === sw.id);
+        if (idx >= 0) list[idx] = Object.assign({}, list[idx], sw);
+        else list.push(sw);
+        this.setFixedCodesList(list);
+        if (parseInt(get('fldFixedCodeId').value || '0', 10) === sw.id) {
+            get('divFixedCodeOnStatus').textContent = sw.hasOn ? tr('FC_LEARNED') : tr('FC_NOT_LEARNED');
+            get('divFixedCodeOffStatus').textContent = sw.hasOff ? tr('FC_LEARNED') : tr('FC_NOT_LEARNED');
+            const cb = get('cbFixedCodeSingleButton');
+            if (cb && !this._fcLearning) cb.checked = !!sw.singleButton;
+            const cbFlip = get('cbFixedCodeFlipCommands');
+            if (cbFlip && !this._fcLearning && typeof sw.flipCommands !== 'undefined') cbFlip.checked = !!sw.flipCommands;
+            this._setFixedCodeDetails(sw);
+            this.onFixedCodeSingleButtonChanged();
+            this._updateFixedCodeTestButtons(sw);
+        }
+    }
+    procFixedCodeLearn(msg) {
+        const banner = get('divFixedCodeLearnBanner');
+        const progress = get('divFixedCodeLearnProgress');
+        const result = get('divFixedCodeLearnResult');
+        if (msg && msg.learning) {
+            this._setFixedCodeLearning(true);
+            if (banner) banner.style.display = '';
+            if (progress) {
+                const rssi = (msg.rssi != null) ? String(msg.rssi) : '--';
+                progress.textContent = tr('FC_LEARN_PROGRESS').replace('%s', String(msg.pulseCount || 0)).replace('%s', rssi);
+            }
+            return;
+        }
+        this._setFixedCodeLearning(false);
+        if (banner) banner.style.display = 'none';
+        if (msg && msg.success) {
+            if (result) {
+                result.style.display = '';
+                result.className = 'success';
+                result.textContent = `${(msg.button || '').toUpperCase()} ${tr('FC_LEARNED')}: ${msg.code || ''} · ${msg.pulseCount || 0} pulses\n${msg.preview || ''}`;
+            }
+            getJSON('/fixedCodes', (err, list) => {
+                if (!err) this.setFixedCodesList(list);
+                const id = parseInt(get('fldFixedCodeId').value || '0', 10);
+                if (id) {
+                    const sw = (this.fixedCodes || []).find(x => x.id === id);
+                    if (sw) {
+                        get('divFixedCodeOnStatus').textContent = sw.hasOn ? tr('FC_LEARNED') : tr('FC_NOT_LEARNED');
+                        get('divFixedCodeOffStatus').textContent = sw.hasOff ? tr('FC_LEARNED') : tr('FC_NOT_LEARNED');
+                        this._setFixedCodeDetails(sw);
+                        this.onFixedCodeSingleButtonChanged();
+                        this._updateFixedCodeTestButtons(sw);
+                    }
+                }
+            });
+        } else if (msg && !msg.cancelled) {
+            if (result) {
+                result.style.display = '';
+                result.className = 'information';
+                const rssi = (typeof msg.rssi === 'number') ? msg.rssi : null;
+                const pulses = msg.pulseCount || 0;
+                let tip = tr('FC_LEARN_FAILED');
+                if (msg.reason === 'weak_rssi') tip = tr('FC_LEARN_FAILED_WEAK') || tip;
+                else if (msg.reason === 'too_few_pulses') tip = tr('FC_LEARN_FAILED_SHORT') || tip;
+                else if (msg.reason === 'bad_timing' || msg.reason === 'noisy') tip = tr('FC_LEARN_FAILED_NOISE') || tip;
+                const detail = [
+                    pulses ? `${pulses} pulses` : '',
+                    (rssi != null) ? `RSSI ${rssi} dBm` : ''
+                ].filter(Boolean).join(' · ');
+                result.textContent = detail ? `${tip}\n${detail}` : tip;
+            }
+            const id = parseInt(get('fldFixedCodeId').value || '0', 10);
+            const sw = id ? (this.fixedCodes || []).find(x => x.id === id) : null;
+            this._updateFixedCodeTestButtons(sw);
+        }
+    }
+    procFixedCodeRemoved(msg) {
+        if (!msg || !msg.id) return;
+        this.setFixedCodesList((this.fixedCodes || []).filter(x => x.id !== msg.id));
+    }
     setShadesList(shades) {
         this.shades = shades;
         let divCfg = '';
         let divCtl = '';
         shades.sort((a, b) => { return a.sortOrder - b.sortOrder });
-        console.log(shades);
-        let roomId = document.querySelector('.room-pill.active') ? parseInt(document.querySelector('.room-pill.active').getAttribute('data-roomid'), 10) : 0;
         let vrList = get('selVRMotor');
         // First get the optiongroup for the shades.
         let optGroup = get('optgrpVRShades');
@@ -3586,36 +5073,44 @@ class Somfy {
             let st = this.shadeTypes.find(x => x.type === shade.shadeType) || { type: shade.shadeType, ico: 'svg-window-shade' };
 
             divCfg += `<div class="somfyShade shade-draggable" draggable="true" data-roomid="${shade.roomId}" data-mypos="${shade.myPos}" data-shadeid="${shade.shadeId}" data-remoteaddress="${shade.remoteAddress}" data-tilt="${shade.tiltType}" data-shadetype="${shade.shadeType}" data-flipposition="${shade.flipPosition ? 'true' : 'false'}"><div class="drag-handle"><svg class="icon-svg"><use href=#svg-drag></use></svg></div><div class="shade-name"><div class="cfg-room">${room.name}</div><div class="name-text">${shade.name}</div></div><div class="idRemoteAddress"><span class="AddrId-label">${tr("ID")}</span><span class="shade-address">${shade.remoteAddress}</span></div><span class="vr"></span><div class="divEditDelete-svg" onclick="somfy.openEditShade(${shade.shadeId});"><svg class="icon-svg"><use href=#svg-edit></use></svg></div><div class="divEditDelete-svg" onclick="somfy.deleteShade(${shade.shadeId});"><svg class="icon-svg"><use href=#svg-close></use></svg></div></div>`;
-            // --- SECTION CONTROLE ---
-            divCtl += `<div class="somfyShadeCtl" style="${roomId === 0 || roomId === room.roomId ? '' : 'display:none'}" data-shadeid="${shade.shadeId}" data-roomid="${shade.roomId}" data-direction="${shade.direction}" data-remoteaddress="${shade.remoteAddress}" data-position="${shade.position}" data-target="${shade.target}" data-mypos="${shade.myPos}" data-mytiltpos="${shade.myTiltPos}" data-shadetype="${shade.shadeType}" data-tilt="${shade.tiltType}" data-flipposition="${shade.flipPosition ? 'true' : 'false'}"
+            const canPos = this.canSetPosition(shade.shadeType);
+            const posClick = canPos ? `onclick="event.stopPropagation(); somfy.openSetPosition(${shade.shadeId});"` : '';
+            divCtl += `<div class="somfyShadeCtl${canPos ? ' can-position' : ''}" style="--pos:${shade.position};--mypos:${shade.myPos}" data-shadeid="${shade.shadeId}" data-roomid="${shade.roomId}" data-direction="${shade.direction}" data-remoteaddress="${shade.remoteAddress}" data-position="${shade.position}" data-target="${shade.target}" data-mypos="${shade.myPos}" data-mytiltpos="${shade.myTiltPos}" data-shadetype="${shade.shadeType}" data-tilt="${shade.tiltType}" data-flipposition="${shade.flipPosition ? 'true' : 'false'}"
             data-windy="${(shade.flags & 0x10) === 0x10 ? 'true' : 'false'}" data-sunny="${(shade.flags & 0x20) === 0x20 ? 'true' : 'false'}">
-            <div class="shadectl-side-handle" onclick="event.stopPropagation(); somfy.openSetPosition(${shade.shadeId});"><svg class="handle-icon"><use href="#svg-arrowRight"></use></svg></div>
-            <div class="shadectl-right-content">
             <div class="shadectl-main-content">
-            <div class="shadectl-header-row"><span class="shadectl-name">${shade.name}</span></div>
-            <div class="shade-icon" data-shadeid="${shade.shadeId}">
-            <svg class="somfy-shade-icon" data-shadeid="${shade.shadeId}" style="--shade-position:${shade.flipPosition ? 100 - shade.position : shade.position}; --fpos:${shade.flipPosition ? 100 - shade.position : shade.position}%">
+            <div class="shade-icon" data-shadeid="${shade.shadeId}" ${posClick}>
+            <svg class="somfy-shade-icon" data-shadeid="${shade.shadeId}" style="--shade-position:${this.iconVisualPosition(shade.position, shade.flipPosition, shade.shadeType)}; --fpos:${shade.position}%">
             <use href="#${st.ico}"></use>
             </svg>
             </div>
-            <div class="shade-name">
-            <span class="shadectl-room">${room.name}</span>`;
-            divCtl += `<span class="shadectl-mypos"><span class="val-pos">Pos: ${shade.position}%</span>`;
-            if (shade.tiltType !== 0) divCtl += `<span class="val-pos"> Tilt: ${shade.tiltPosition}%</span>`;
-            divCtl += `</span></div>
+            <div class="shadectl-meta">
+            <span class="shadectl-name">${shade.name}</span>
+            <span class="shadectl-room">${room.name}</span>
+            </div>
+            <button type="button" class="shadectl-pos-pill" ${posClick} title="${tr('SHADE_SET_POSITION') || 'Set position'}">
+            <span class="val-pos">${this.formatPosLabel(shade.position)}</span>`;
+            if (shade.tiltType !== 0) divCtl += `<span class="val-pos shadectl-tilt">Tilt ${shade.tiltPosition}%</span>`;
+            if (shade.myPos >= 0) divCtl += `<span class="val-my shadectl-my">${tr('HOME_QA_MY') || 'My'} ${this.formatPosLabel(shade.myPos)}</span>`;
+            divCtl += `</button>
             <div class="shadectl-buttons" data-shadeType="${shade.shadeType}">
             <div class="button-outline cmd-button btn-somfy-svg animScale" data-cmd="up" data-shadeid="${shade.shadeId}"><svg><use href="#svg-up"></use></svg></div>
             <div class="button-outline cmd-button btn-somfy-svg animScale" data-cmd="my" data-shadeid="${shade.shadeId}"><svg><use href="#svg-my"></use></svg></div>
             <div class="button-outline cmd-button btn-somfy-svg animScale" data-cmd="down" data-shadeid="${shade.shadeId}"><svg><use href="#svg-down"></use></svg></div>
             <div class="button-outline cmd-button btn-somfy-svg-wide animScale" data-cmd="toggle" data-shadeid="${shade.shadeId}"><svg><use href="#svg-toggle"></use></svg></div>
             </div>
+            <button type="button" class="shadectl-more" data-shadeid="${shade.shadeId}" title="${tr('HOME_MORE') || 'More'}" aria-label="${tr('HOME_MORE') || 'More'}">
+            <svg><use href="#svg-more"></use></svg>
+            </button>
+            </div>
+            <div class="shadectl-track" ${posClick} title="${tr('SHADE_SET_POSITION') || 'Set position'}">
+            <div class="shadectl-track-fill"></div>
+            <div class="shadectl-track-my"></div>
+            </div>
             <div class="shadectl-status-bar">
             <div class="shadectl-status-left">
             <div class="indicator indicator-wind"><svg><use href="#indic-wind"></use></svg></div>
             <div class="indicator indicator-sun"><svg><use href="#indic-sun"></use></svg></div>
-            <div class="val-my myShade-badge">My: ${shade.myPos === -1 ? '---' : shade.myPos + '%'}</div>`;
-            if (shade.tiltType !== 0) divCtl += `<div class="val-tilt myShade-badge">My Tilt: ${shade.myTiltPos === -1 ? '---' : shade.myTiltPos + '%'}</div>`;
-            divCtl += `</div>
+            </div>
             <div class="status-group-right">
             <div class="button-light cmd-button" data-cmd="light" data-shadeid="${shade.shadeId}" data-on="${isLightOn ? 'true' : 'false'}" style="${!shade.light ? 'display:none' : ''}">
             <svg><use href="#svg-lightbulb"></use></svg>
@@ -3625,12 +5120,18 @@ class Somfy {
                 <svg><use href="#svg-sun"></use></svg>
                 </div>`;
             }
-            divCtl += `<div class="button-my" onclick="event.stopPropagation(); somfy.openSetMyPosition(${shade.shadeId});">
+            divCtl += `<div class="button-cfg" title="${tr('SHADE_CONFIGURE')}" onclick="event.stopPropagation(); somfy.configureShade(${shade.shadeId});">
+            <svg><use href="#svg-cfg"></use></svg>
+            </div>
+            <div class="button-pin${this.getFavoriteIds().includes(Number(shade.shadeId)) ? ' is-pinned' : ''}" title="${tr('HOME_PIN_FAVORITE') || 'Pin to Home'}" onclick="event.stopPropagation(); somfy.toggleFavorite(${shade.shadeId});">
             <svg><use href="#svg-favori"></use></svg>
-            </div></div></div></div></div></div></div>`;
+            </div>
+            <div class="button-my${shade.myPos >= 0 ? ' has-mypos' : ''}" title="${shade.myPos >= 0 ? ((tr('HOME_QA_MY') || 'My') + ' ' + this.formatPosLabel(shade.myPos)) : (tr('SHADE_FAVORITE_POSITION'))}" onclick="event.stopPropagation(); somfy.openSetMyPosition(${shade.shadeId});">
+            <svg><use href="#svg-my"></use></svg>
+            </div></div></div></div>`;
 
             let opt = document.createElement('option');
-            opt.innerHTML = shade.name;
+            opt.textContent = room.name ? `${room.name} - ${shade.name}` : shade.name;
 
             opt.setAttribute('data-address', shade.remoteAddress);
             opt.setAttribute('data-type', 'shade');
@@ -3644,95 +5145,10 @@ class Somfy {
         get('divShadeList').innerHTML = divCfg;
         let shadeControls = get('divShadeControls');
         shadeControls.innerHTML = divCtl;
+        this.ensureHomeCmdDelegation();
+        this.applyHomeFilter();
         this.checkEmptyState();
-        // Attach the timer for setting the My Position for the shade.
-        let btns = shadeControls.querySelectorAll('div.cmd-button');
-        for (let i = 0; i < btns.length; i++) {
-            btns[i].addEventListener('mouseup', (event) => {
-                console.log(this);
-                console.log(event);
-                console.log('mouseup');
-                let cmd = event.currentTarget.getAttribute('data-cmd');
-                let shadeId = parseInt(event.currentTarget.getAttribute('data-shadeid'), 10);
-                if (this.btnTimer) {
-                    console.log({ timer: true, isOn: event.currentTarget.getAttribute('data-on'), cmd: cmd });
-                    clearTimeout(this.btnTimer);
-                    this.btnTimer = null;
-                    if (new Date().getTime() - this.btnDown > 2000) event.preventDefault();
-                    else this.sendCommand(shadeId, cmd);
-                }
-                else if (cmd === 'light') {
-                    event.currentTarget.setAttribute('data-on', !makeBool(event.currentTarget.getAttribute('data-on')));
-                }
-                else if (cmd === 'sunflag') {
-                    if (makeBool(event.currentTarget.getAttribute('data-on')))
-                        this.sendCommand(shadeId, 'flag');
-                    else
-                        this.sendCommand(shadeId, 'sunflag');
-                }
-                else this.sendCommand(shadeId, cmd);
-            }, true);
-            btns[i].addEventListener('mousedown', (event) => {
-                if (this.btnTimer) {
-                    clearTimeout(this.btnTimer);
-                    this.btnTimer = null;
-                }
-                console.log(this);
-                console.log(event);
-                console.log('mousedown');
-                let elShade = event.currentTarget.closest('div.somfyShadeCtl');
-                let cmd = event.currentTarget.getAttribute('data-cmd');
-                let shadeId = parseInt(event.currentTarget.getAttribute('data-shadeid'), 10);
-                let el = event.currentTarget.closest('.somfyShadeCtl');
-                this.btnDown = new Date().getTime();
-                if (cmd === 'my') {
-                    if (parseInt(el.getAttribute('data-direction'), 10) === 0) {
-                        this.btnTimer = setTimeout(() => {
-                            // Open up the set My Position dialog.  We will allow the user to change the position to match
-                            // the desired position.
-                            this.openSetMyPosition(shadeId);
-                        }, 2000);
-                    }
-                }
-                else if (cmd === 'light') return;
-                else if (cmd === 'sunflag') return;
-                else if (makeBool(elShade.getAttribute('data-tilt'))) {
-                    this.btnTimer = setTimeout(() => {
-                        this.sendTiltCommand(shadeId, cmd);
-                    }, 2000);
-                }
-            }, true);
-            btns[i].addEventListener('touchstart', (event) => {
-                if (this.btnTimer) {
-                    clearTimeout(this.btnTimer);
-                    this.btnTimer = null;
-                }
-                console.log(this);
-                console.log(event);
-                console.log('touchstart');
-                let elShade = event.currentTarget.closest('div.somfyShadeCtl');
-                let cmd = event.currentTarget.getAttribute('data-cmd');
-                let shadeId = parseInt(event.currentTarget.getAttribute('data-shadeid'), 10);
-                let el = event.currentTarget.closest('.somfyShadeCtl');
-                this.btnDown = new Date().getTime();
-                if (parseInt(el.getAttribute('data-direction'), 10) === 0) {
-                    if (cmd === 'my') {
-                        this.btnTimer = setTimeout(() => {
-                            // Open up the set My Position dialog.  We will allow the user to change the position to match
-                            // the desired position.
-                            this.openSetMyPosition(shadeId);
-                        }, 2000);
-                    }
-                    else {
-                        if (makeBool(elShade.getAttribute('data-tilt'))) {
-                            this.btnTimer = setTimeout(() => {
-                                this.sendTiltCommand(shadeId, cmd);
-                            }, 2000);
-                        }
-                    }
-                }
-            }, true);
-        }
+        this.refreshHomeChrome();
         this.setListDraggable(get('divShadeList'), '.shade-draggable', (list) => {
             // Get the shade order
             let items = list.querySelectorAll('.shade-draggable');
@@ -3750,6 +5166,12 @@ class Somfy {
                 }
             });
         });
+        this.updateCapacityCounts();
+        if (typeof alexa !== 'undefined') {
+            const panel = get('divAlexa');
+            if (panel && panel.style.display !== 'none') alexa.renderList();
+            alexa.refreshCount();
+        }
     }
     setListDraggable(list, cl, cb) {
         let el = null, gh = null, ch = false, sA = null;
@@ -3868,8 +5290,6 @@ class Somfy {
                 optGroup.innerHTML = '';
             }
         }
-        let roomId = document.querySelector('.room-pill.active') ? parseInt(document.querySelector('.room-pill.active').getAttribute('data-roomid'), 10) : 0;
-
         if (typeof groups !== 'undefined') {
             groups.sort((a, b) => a.sortOrder - b.sortOrder);
 
@@ -3879,7 +5299,7 @@ class Somfy {
                 // --- Section Configuration ---
                 divCfg += `<div class="somfyGroup group-draggable" draggable="true" data-roomid="${group.roomId}" data-groupid="${group.groupId}" data-remoteaddress="${group.remoteAddress}"><div class="drag-handle"><svg class="icon-svg"><use href=#svg-drag></use></svg></div> <div class="group-name"><div class="cfg-room">${room.name}</div><div class="name-text">${group.name}</div></div><div class="idRemoteAddress"><span class="AddrId-label">${tr("ID")}</span><span class="group-address">${group.remoteAddress}</span></div><span class="vr"></span><div class="divEditDelete-svg" onclick="somfy.openEditGroup(${group.groupId});"><svg class="icon-svg"><use href=#svg-edit></use></svg></div><div class="divEditDelete-svg" onclick="somfy.deleteGroup(${group.groupId});"><svg class="icon-svg" style="color: var(--danger-color, red);"><use href=#svg-close></use></svg></div></div>`;
                 // --- Section Contrôle (divCtl) ---
-                divCtl += `<div class="somfyGroupCtl" style="${roomId === 0 || roomId === room.roomId ? '' : 'display:none'}" data-groupId="${group.groupId}" data-roomid="${group.roomId}" data-remoteaddress="${group.remoteAddress}">
+                divCtl += `<div class="somfyGroupCtl" data-groupId="${group.groupId}" data-roomid="${group.roomId}" data-remoteaddress="${group.remoteAddress}">
                 <div class="group-name">
                 <span class="groupctl-room">${room.name}</span>
                 <span class="groupctl-name">${group.name}</span>
@@ -3897,7 +5317,7 @@ class Somfy {
                 </div>`;
 
                 let opt = document.createElement('option');
-                opt.innerHTML = group.name;
+                opt.textContent = room.name ? `${room.name} - ${group.name}` : group.name;
                 opt.setAttribute('data-address', group.remoteAddress);
                 opt.setAttribute('data-type', 'group');
                 opt.setAttribute('data-groupid', group.groupId);
@@ -3910,25 +5330,9 @@ class Somfy {
         get('divGroupList').innerHTML = divCfg;
         let groupControls = get('divGroupControls');
         groupControls.innerHTML = divCtl;
+        this.ensureHomeCmdDelegation();
+        this.applyHomeFilter();
         this.checkEmptyState();
-        // Attach the timer for setting the My Position for the Group.
-        let btns = groupControls.querySelectorAll('div.cmd-button');
-        for (let i = 0; i < btns.length; i++) {
-            btns[i].addEventListener('click', (event) => {
-                console.log(this);
-                console.log(event);
-                let groupId = parseInt(event.currentTarget.getAttribute('data-groupid'), 10);
-                let cmd = event.currentTarget.getAttribute('data-cmd');
-                if (cmd === 'sunflag') {
-                    if (makeBool(event.currentTarget.getAttribute('data-on')))
-                        this.sendGroupCommand(groupId, 'flag');
-                    else
-                        this.sendGroupCommand(groupId, 'sunflag');
-                }
-                else
-                    this.sendGroupCommand(groupId, cmd);
-            }, true);
-        }
         this.setListDraggable(get('divGroupList'), '.group-draggable', (list) => {
             // Get the shade order
             let items = list.querySelectorAll('.group-draggable');
@@ -3946,13 +5350,10 @@ class Somfy {
                 }
             });
         });
+        this.updateCapacityCounts();
     }
     closeShadePositioners() {
-        let ctls = document.querySelectorAll('.shade-positioner');
-        for (let i = 0; i < ctls.length; i++) {
-            console.log('Closing shade positioner');
-            ctls[i].remove();
-        }
+        this.dismissPositioners(false);
     }
     openSetMyPosition(shadeId) {
         if (typeof shadeId === 'undefined') return;
@@ -3960,29 +5361,31 @@ class Somfy {
         const shade = document.querySelector(`div.somfyShadeCtl[data-shadeid="${shadeId}"]`);
         if (!shade) return;
 
-        const arrowUse = shade.querySelector('.handle-icon use');
-
-        document.querySelectorAll('.shade-positioner').forEach(el => {
-            el.remove();
-            document.querySelectorAll('.handle-icon use').forEach(u => u.setAttribute('href', '#svg-arrowRight'));
-        });
+        const existing = shade.querySelector('.shade-positioner');
+        if (existing) {
+            this.dismissPositioners();
+            return;
+        }
+        this.dismissPositioners(false);
 
         const currPos = parseInt(shade.getAttribute('data-position'), 10) || 0;
         const currTiltPos = parseInt(shade.getAttribute('data-tiltposition'), 10) || 0;
         const myPos = parseInt(shade.getAttribute('data-mypos'), 10);
         const myTiltPos = parseInt(shade.getAttribute('data-mytiltpos'), 10);
         const tiltType = parseInt(shade.getAttribute('data-tilt'), 10) || 0;
-        const lbl = makeBool(shade.getAttribute('data-flipposition')) ? `% ${tr('POPUP_OPEN')}` : `% ${tr('POPUP_CLOSED')}`;
+        const scaleHint = tr('POPUP_POS_SCALE') || '100% open · 0% closed';
 
         const positionSlider = (tiltType !== 3) ? `
         <div class="slider-group">
-        <div class="slider-header"><span class="title">${tr('POPUP_TARGET_POSITION')}</span><span class="val"><span id="spanShadeTarget">${currPos}</span> ${lbl}</span></div>
+        <div class="slider-header"><span class="title">${tr('POPUP_TARGET_POSITION')}</span><span class="val"><span id="spanShadeTarget">${currPos}</span>%</span></div>
+        <div class="uniStatus pos-scale-hint">${scaleHint}</div>
         <input id="slidShadeTarget" type="range" min="0" max="100" step="1" value="${currPos}" oninput="get('spanShadeTarget').innerHTML=this.value;">
         </div>` : '';
 
         const tiltSlider = (tiltType > 0) ? `
         <div class="slider-group">
-        <div class="slider-header"><span class="title">${tr('POPUP_TARGET_TILT_POSITION')}</span><span class="val"><span id="spanShadeTiltTarget">${currTiltPos}</span> ${lbl}</span></div>
+        <div class="slider-header"><span class="title">${tr('POPUP_TARGET_TILT_POSITION')}</span><span class="val"><span id="spanShadeTiltTarget">${currTiltPos}</span>%</span></div>
+        <div class="uniStatus pos-scale-hint">${scaleHint}</div>
         <input id="slidShadeTiltTarget" type="range" min="0" max="100" step="1" value="${currTiltPos}" oninput="get('spanShadeTiltTarget').innerHTML=this.value;">
         </div>` : '';
 
@@ -3992,6 +5395,7 @@ class Somfy {
         div.onclick = (e) => e.stopPropagation();
         div.innerHTML = `
         <div class="shade-positioner-inner">
+        <button type="button" class="pos-close" aria-label="${tr('BT_CANCEL_1') || 'Close'}"><svg class="icon-svg"><use href="#svg-close"></use></svg></button>
         ${positionSlider}${tiltSlider}
         <div class="popup-actions">
         <button id="btnSetMyPosition" pop type="button">${tr("BT_SET_MY_POSITION")}</button>
@@ -4000,13 +5404,8 @@ class Somfy {
         </div>`;
 
         shade.appendChild(div);
-        if (arrowUse) arrowUse.setAttribute('href', '#svg-arrowLeft');
 
-        const animateClose = () => {
-            div.classList.add('popup-slide-out');
-            if (arrowUse) arrowUse.setAttribute('href', '#svg-arrowRight');
-            setTimeout(() => { div.remove(); }, 300);
-        };
+        const animateClose = () => this.dismissPositioners();
         const elTarget = div.querySelector('#slidShadeTarget');
         const elTiltTarget = div.querySelector('#slidShadeTiltTarget');
         const elBtnSave = div.querySelector('#btnSetMyPosition');
@@ -4033,6 +5432,8 @@ class Somfy {
             fnUpdateUI();
         };
 
+        const elClose = div.querySelector('.pos-close');
+        if (elClose) elClose.onclick = (e) => { e.preventDefault(); e.stopPropagation(); animateClose(); };
         elBtnCancel.onclick = (e) => { e.preventDefault(); animateClose(); };
         elBtnSave.onclick = (e) => {
             e.preventDefault();
@@ -4055,6 +5456,72 @@ class Somfy {
             this.closeShadePositioners();
             overlay.remove();
             console.log(response);
+        });
+    }
+    setCalibratePositionSlider(pos) {
+        const g = get;
+        const p = Math.max(0, Math.min(100, parseInt(pos, 10) || 0));
+        if (g('slidCalibratePos')) g('slidCalibratePos').value = p;
+        if (g('spanCalibratePos')) g('spanCalibratePos').innerText = p;
+    }
+    onFlipPositionChanged() {
+        // Keep calibrate slider aligned with reported % after toggle + save;
+        // live preview uses current reported position from the label.
+        const g = get;
+        if (g('valPos')) this.setCalibratePositionSlider(g('valPos').innerText);
+    }
+    _applyCalibratedShadeUi(shade) {
+        const g = get;
+        if (!shade || typeof shade.position === 'undefined') return false;
+        if (g('valPos')) g('valPos').innerText = shade.position;
+        this.setCalibratePositionSlider(shade.position);
+        if (g('cbFlipPosition') && typeof shade.flipPosition !== 'undefined') {
+            g('cbFlipPosition').checked = !!shade.flipPosition;
+        }
+        if (g('cbExposeAlexa') && typeof shade.exposeAlexa !== 'undefined') {
+            g('cbExposeAlexa').checked = !!shade.exposeAlexa;
+        }
+        if (g('cbFlipCommands') && typeof shade.flipCommands !== 'undefined') {
+            g('cbFlipCommands').checked = !!shade.flipCommands;
+        }
+        const shadeId = shade.shadeId;
+        const shadeType = shade.shadeType ?? shade.type;
+        this.applyShadeIconPosition(g('icoShade'), shade.position, shade.flipPosition, shadeType);
+        document.querySelectorAll(`.somfyShadeCtl[data-shadeid="${shadeId}"]`).forEach(d => {
+            d.dataset.position = shade.position;
+            d.dataset.target = shade.target;
+            d.dataset.flipposition = shade.flipPosition ? 'true' : 'false';
+            d.style.setProperty('--pos', shade.position);
+            const spans = d.querySelectorAll('.val-pos');
+            if (spans[0]) spans[0].innerText = this.formatPosLabel(shade.position);
+        });
+        document.querySelectorAll(`.somfy-shade-icon[data-shadeid="${shadeId}"]`).forEach(el => {
+            this.applyShadeIconPosition(el, shade.position, shade.flipPosition, shadeType);
+        });
+        return true;
+    }
+    calibrateShadePosition() {
+        const g = get;
+        const shadeId = parseInt(g('spanShadeId')?.innerText, 10);
+        if (isNaN(shadeId) || shadeId >= 255) {
+            return ui.errorMessage(g('divSomfySettings'), tr('ERR_SHADE_ID_REQUIRED'));
+        }
+        const pos = parseInt(g('slidCalibratePos')?.value, 10);
+        if (isNaN(pos) || pos < 0 || pos > 100) return;
+        // Save invert flags + position together so Apply matches the checkboxes on screen
+        // (wording-only labels; field names remain flipPosition / flipCommands / position).
+        const payload = {
+            shadeId,
+            flipPosition: !!(g('cbFlipPosition') && g('cbFlipPosition').checked),
+            flipCommands: !!(g('cbFlipCommands') && g('cbFlipCommands').checked),
+            position: pos
+        };
+        putJSONSync('/saveShade', payload, (err, shade) => {
+            if (err) return ui.serviceError(err);
+            if (!this._applyCalibratedShadeUi(shade)) {
+                return ui.errorMessage(g('divSomfySettings'), 'Calibration failed');
+            }
+            ui.successMessage(tr('MSG_SAVE_SUCCESS'));
         });
     }
     setLinkedRemotesList(shade) {
@@ -4128,13 +5595,16 @@ class Somfy {
     procShadeState(state) {
         const g = get, sId = state.shadeId;
 
+        const shadeType = state.shadeType ?? state.type;
         document.querySelectorAll(`.somfy-shade-icon[data-shadeid="${sId}"]`).forEach(ico => {
-            const p = state.flipPosition ? 100 - state.position : state.position;
-            ico.style.setProperty('--shade-position', p);
-            ico.style.setProperty('--fpos', state.position + '%');
+            this.applyShadeIconPosition(ico, state.position, state.flipPosition, shadeType);
         });
         if (g('spanShadeId')?.innerText == sId) {
             if (g('valPos')) g('valPos').innerText = state.position;
+            // Keep calibrate slider in sync with live reported position.
+            if (g('divCalibratePosition')?.style.display !== 'none') {
+                this.setCalibratePositionSlider(state.position);
+            }
 
             const lTC = g('labelTiltContainer'), sVT = g('valTilt');
             if (state.tiltType !== 0) {
@@ -4167,16 +5637,40 @@ class Somfy {
                 });
             }
 
+            d.style.setProperty('--pos', state.position);
+            d.style.setProperty('--mypos', state.myPos);
             const spans = d.querySelectorAll('.val-pos');
-            if (spans[0]) spans[0].innerText = `Pos: ${state.position}%`;
-            if (state.tiltType !== 0 && spans[1]) spans[1].innerText = `Tilt: ${state.tiltPosition}%`;
-
-            const upTxt = (sel, pre, val) => {
-                const el = d.querySelector(sel);
-                if (el) el.innerText = `${pre}: ${val !== undefined && val >= 0 ? val + '%' : '---'}`;
-            };
-            upTxt('.val-my', 'My', state.myPos);
-            upTxt('.val-tilt', 'My Tilt', state.myTiltPos);
+            if (spans[0]) spans[0].innerText = this.formatPosLabel(state.position);
+            if (state.tiltType !== 0 && spans[1]) spans[1].innerText = `Tilt ${state.tiltPosition}%`;
+            const myEl = d.querySelector('.val-my');
+            if (state.myPos >= 0) {
+                const txt = `${tr('HOME_QA_MY') || 'My'} ${this.formatPosLabel(state.myPos)}`;
+                if (myEl) myEl.innerText = txt;
+                else {
+                    const pill = d.querySelector('.shadectl-pos-pill');
+                    if (pill) {
+                        const s = document.createElement('span');
+                        s.className = 'val-my shadectl-my';
+                        s.innerText = txt;
+                        pill.appendChild(s);
+                    }
+                }
+            } else if (myEl) myEl.remove();
+            const myBtn = d.querySelector('.button-my');
+            if (myBtn) {
+                myBtn.classList.toggle('has-mypos', state.myPos >= 0);
+                myBtn.title = state.myPos >= 0
+                    ? `${tr('HOME_QA_MY') || 'My'} ${this.formatPosLabel(state.myPos)}`
+                    : (tr('SHADE_FAVORITE_POSITION') || 'My');
+            }
+            if (Array.isArray(this.shades)) {
+                const rec = this.shades.find(s => Number(s.shadeId) === Number(sId));
+                if (rec) {
+                    rec.position = state.position;
+                    rec.myPos = state.myPos;
+                    if (state.tiltPosition !== undefined) rec.tiltPosition = state.tiltPosition;
+                }
+            }
         });
     }
     procRemoteFrame(frame) {
@@ -4210,10 +5704,60 @@ class Somfy {
         row.className = 'frame-row';
         row.dataset.valid = frame.valid;
 
-        row.innerHTML = `<span>${frame.encKey}</span><span>${frame.address}</span><span>${frame.command}<sup>${frame.stepSize || ''}</sup></span><span>${frame.rcode}</span><span>${frame.rssi}dBm</span><span>${frame.bits}${proto}</span><span>${timeStr}</span><div class="frame-pulses">${frame.pulses.join(',')}</div>`;
+        row.innerHTML = `<span>${frame.encKey}</span><span>${frame.address}</span><span>${frame.command}<sup>${frame.stepSize || ''}</sup></span><span>${frame.rcode}</span><span>${frame.rssi}dBm</span><span>${frame.bits}${proto}</span><span title="${timeStr}">${timeStr}</span><span class="frame-src" title="${frame.src || ''}">${frame.src || '—'}</span><div class="frame-pulses">${(frame.pulses || []).join(',')}</div>`;
 
         qs('divFrames').prepend(row);
         this.frames.push(frame);
+        if (typeof mesh !== 'undefined') mesh.logFrame('RX', frame);
+    }
+    procTxFrame(frame) {
+        if (typeof mesh !== 'undefined') mesh.logFrame('TX', frame);
+        if (localStorage.getItem('rfTxDebug') !== '1') return;
+        const list = get('divTxFrames');
+        if (!list) return;
+        const empty = list.querySelector('.tx-debug-empty');
+        if (empty) empty.remove();
+        const dt = new Date();
+        const timeStr = `${dt.getHours().fmt('00')}:${dt.getMinutes().fmt('00')}:${dt.getSeconds().fmt('00')}.${dt.getMilliseconds().fmt('000')}`;
+        const protos = { 1: '-W', 2: '-V' };
+        const proto = protos[frame.proto] || '-S';
+        const cmd = frame.cmd || frame.command || '';
+        const frames = frame.frames != null ? frame.frames : (1 + (frame.repeats || 0));
+        const followUps = frame.repeats != null ? frame.repeats : Math.max(0, frames - 1);
+        const row = document.createElement('div');
+        row.className = 'tx-debug-row';
+        row.innerHTML = `<span>${frames}</span><span>${frame.address}</span><span>${cmd}</span><span>${frame.rcode}</span><span>${followUps}</span><span>${frame.bits || ''}${proto}</span><span>${timeStr}</span>`;
+        list.prepend(row);
+        while (list.children.length > 200) list.lastChild.remove();
+        this.txFrames.push(Object.assign({ time: timeStr }, frame));
+        if (this.txFrames.length > 200) this.txFrames.shift();
+        if (typeof general !== 'undefined') general.refreshTxDebugChrome();
+    }
+    clearFrameLogs() {
+        const rx = get('divFrames');
+        if (rx) rx.innerHTML = '';
+        this.frames = [];
+    }
+    clearTxFrameLogs() {
+        const tx = get('divTxFrames');
+        if (tx && typeof general !== 'undefined') general.renderTxDebugEmpty(tx);
+        else if (tx) tx.innerHTML = '<div class="tx-debug-empty" tr="TX_DEBUG_EMPTY">Waiting for TX… press Up/Down/My</div>';
+        this.txFrames = [];
+        if (typeof general !== 'undefined') general.refreshTxDebugChrome();
+    }
+    txFramesToClipboard() {
+        const text = this.JSONPretty(this.txFrames, 2);
+        if (typeof navigator.clipboard !== 'undefined')
+            navigator.clipboard.writeText(text);
+        else {
+            let dummy = document.createElement('textarea');
+            document.body.appendChild(dummy);
+            dummy.value = text;
+            dummy.focus();
+            dummy.select();
+            document.execCommand('copy');
+            document.body.removeChild(dummy);
+        }
     }
     JSONPretty(obj, indent = 2) {
         if (Array.isArray(obj)) {
@@ -4262,12 +5806,16 @@ class Somfy {
             }
     }
     framesToClipboard() {
+        const payload = (localStorage.getItem('rfTxDebug') === '1')
+            ? { rx: this.frames, tx: this.txFrames }
+            : this.frames;
+        const text = this.JSONPretty(payload, 2);
         if (typeof navigator.clipboard !== 'undefined')
-            navigator.clipboard.writeText(this.JSONPretty(this.frames, 2));
+            navigator.clipboard.writeText(text);
         else {
             let dummy = document.createElement('textarea');
             document.body.appendChild(dummy);
-            dummy.value = this.JSONPretty(this.frames, 2);
+            dummy.value = text;
             dummy.focus();
             dummy.select();
             document.execCommand('copy');
@@ -4311,6 +5859,7 @@ class Somfy {
             disp('divLightSwitch', st.light);
             disp('divFlipPosition', st.fpos);
             disp('divFlipCommands', st.fcmd);
+            disp('divExposeAlexa', type !== 9 && type !== 10);
 
             const fldTilt = g('fldTiltTime')?.parentElement;
             if (fldTilt) fldTilt.style.display = curTilt ? 'inline-block' : 'none';
@@ -4335,7 +5884,8 @@ class Somfy {
     }
     openEditRoom(roomId) {
         if (typeof roomId === 'undefined') {
-            if (_rooms.length >= 15) {
+            const nRooms = _rooms.filter(r => r.roomId).length;
+            if (nRooms >= (this.maxRooms || 24)) {
                 ui.errorMessage(get('divSomfySettings'), tr('ERR_ROOM_LIMIT_REACHED'));
                 return;
             }
@@ -4366,13 +5916,22 @@ class Somfy {
             });
         }
     }
+    configureShade(shadeId) {
+        // Open Devices settings for this shade from the home dashboard.
+        ui.setConfigPanel();
+        const parentTab = document.querySelector('.tab-container [data-grpid="divSomfySettings"]');
+        if (parentTab) ui.selectTab(parentTab);
+        const motorTab = document.querySelector('.subtab-container [data-grpid="divSomfyMotors"]');
+        if (motorTab) ui.selectTab(motorTab);
+        this.openEditShade(shadeId);
+    }
     openEditShade(shadeId) {
         const g = get,
         isNew = shadeId === undefined,
         ico = g('icoShade'),
-        btns = ['btnPairShade', 'btnUnpairShade', 'btnLinkRemote', 'hrSetRollingC', 'btnSetRollingCode'];
+        btns = ['btnPairShade', 'btnUnpairShade', 'btnForceUnpairShade', 'btnLinkRemote', 'hrSetRollingC', 'btnSetRollingCode'];
 
-        if (isNew && this.shades?.length >= 30)
+        if (isNew && this.shades?.length >= (this.maxShades || 48))
             return ui.errorMessage(g('divSomfySettings'), tr('ERR_DEVICE_LIMIT_REACHED'));
 
         const s = (id, d) => { const e = g(id); if(e) e.style.display = d; };
@@ -4380,7 +5939,7 @@ class Somfy {
         s('divshowSomfyButtons', 'flex');
         g('divshowSomfyButtons')?.classList.toggle('disabled', isNew);
         btns.forEach(id => s(id, 'none'));
-        ['blocPairDevice', 'divLinkedRemoteList', 'labelPosContainer'].forEach(id => s(id, 'none'));
+        ['blocPairDevice', 'divLinkedRemoteList', 'labelPosContainer', 'labelPosHint', 'divCalibratePosition'].forEach(id => s(id, 'none'));
 
         getJSONSync(isNew ? '/getNextShade' : `/shade?shadeId=${shadeId}`, (err, shade) => {
             if (err) return ui.serviceError(err);
@@ -4393,13 +5952,22 @@ class Somfy {
             }
             if (!isNew) {
                 s('labelPosContainer', 'block');
+                s('labelPosHint', 'block');
                 s('blocPairDevice', 'flex');
+                s('divCalibratePosition', 'block');
                 ['btnLinkRemote', 'btnSetRollingCode'].forEach(id => s(id, 'flex'));
                 s('hrSetRollingC', 'block');
                 s(shade.paired ? 'btnUnpairShade' : 'btnPairShade', 'inline-block');
+                s('btnForceUnpairShade', shade.paired ? 'none' : 'inline-block');
+                s('divRemoteIdTip', shade.paired ? 'none' : 'block');
 
                 if (g('valPos')) g('valPos').innerText = shade.position;
+                this.setCalibratePositionSlider(shade.position);
                 this.setLinkedRemotesList(shade);
+            } else {
+                s('labelPosHint', 'none');
+                s('divCalibratePosition', 'none');
+                s('divRemoteIdTip', 'block');
             }
 
             if (g('valTilt')) g('valTilt').innerText = shade.tiltPosition || 0;
@@ -4407,14 +5975,11 @@ class Somfy {
             ui.setFocus('btnPairShade', !isNew && !shade.paired);
 
             const rev = shade.flipPosition,
-            p = rev ? 100 - shade.position : shade.position,
             tp = rev ? 100 - shade.tiltPosition : shade.tiltPosition;
 
             if (ico) {
-                const st = ico.style;
-                st.setProperty('--shade-position', p);
-                st.setProperty('--fpos', p + '%');
-                st.setProperty('--tilt-position', tp + '%');
+                this.applyShadeIconPosition(ico, shade.position, shade.flipPosition, shade.shadeType);
+                ico.style.setProperty('--tilt-position', tp + '%');
                 ico.setAttribute('data-shadeid', isNew ? '*' : shadeId);
             }
             g('btnSaveShade').innerText = tr(isNew ? 'BT_CREATE' : 'BT_SAVE');
@@ -4535,7 +6100,7 @@ class Somfy {
         let roomId = parseInt(get('spanRoomId').innerText, 10);
         let obj = ui.fromElement(get('somfyRoom'));
         let valid = true;
-        if (valid && (typeof obj.name !== 'string' || obj.name === '' || obj.name.length > 20)) {
+        if (valid && (typeof obj.name !== 'string' || obj.name === '' || obj.name.length > 32)) {
             ui.errorMessage(get('divSomfySettings'), tr('ERR_ROOM_NAME_INVALID'));
             valid = false;
         }
@@ -4579,13 +6144,19 @@ class Somfy {
 
         const checks = [
             [isNaN(obj.remoteAddress) || obj.remoteAddress < 1 || obj.remoteAddress > 16777215, 'ERR_REMOTE_ADDRESS_INVALID'],
-            [!obj.name || obj.name.length > 20, 'ERR_DEVIVE_NAME_INVALID'],
+            [!obj.name || obj.name.length > 32, 'ERR_DEVIVE_NAME_INVALID'],
             [isNaN(obj.upTime) || obj.upTime < 1 || obj.upTime > 180000, 'ERR_UP_TIME_INVALID'],
             [isNaN(obj.downTime) || obj.downTime < 1 || obj.downTime > 180000, 'ERR_DOWN_TIME_INVALID']
         ];
 
         const basicError = checks.find(c => c[0]);
         if (basicError) return ui.errorMessage(settings, tr(basicError[1]));
+
+        const conflict = this.findRemoteAddressConflict(obj.remoteAddress, isNaN(sId) ? null : sId, null);
+        if (conflict) {
+            return ui.errorMessage(settings,
+                tr('ERR_REMOTE_ADDRESS_IN_USE').replace('%1', String(obj.remoteAddress)).replace('%2', conflict));
+        }
         if (obj.proto === 8 || obj.proto === 9) {
             const isSp = [5, 14, 15, 16, 10].includes(obj.shadeType);
 
@@ -4598,6 +6169,15 @@ class Somfy {
         }
         const isNew = isNaN(sId) || sId >= 255;
         if (!isNew) obj.shadeId = sId;
+        // Explicit — checkbox bind can be missed if the row was hidden mid-edit.
+        if (g('cbExposeAlexa') && g('divExposeAlexa')?.style.display !== 'none')
+            obj.exposeAlexa = !!g('cbExposeAlexa').checked;
+        // Persist calibrate slider with Save (same 100%=open · 0%=closed scale).
+        const cal = g('slidCalibratePos');
+        if (!isNew && cal && g('divCalibratePosition')?.style.display !== 'none') {
+            const p = parseInt(cal.value, 10);
+            if (!isNaN(p) && p >= 0 && p <= 100) obj.position = p;
+        }
 
         putJSONSync(isNew ? '/addShade' : '/saveShade', obj, (err, shade) => {
             if (err) return ui.serviceError(err);
@@ -4605,9 +6185,32 @@ class Somfy {
             console.log("Shade saved/added:", shade);
             const msg = isNew ? tr('MSG_ADD_SUCCESS') : tr('MSG_SAVE_SUCCESS');
             ui.successMessage(msg);
+            if (shade && typeof shade.exposeAlexa !== 'undefined' && this.shades) {
+                const idx = this.shades.findIndex(s => Number(s.shadeId) === Number(shade.shadeId));
+                if (idx >= 0) this.shades[idx].exposeAlexa = !!shade.exposeAlexa;
+            }
             this.updateShadeList();
             this.openEditShade(shade.shadeId);
         });
+    }
+    findRemoteAddressConflict(address, excludeShadeId, excludeGroupId) {
+        const addr = Number(address);
+        if (!addr) return null;
+        const shades = this.shades || [];
+        for (let i = 0; i < shades.length; i++) {
+            const s = shades[i];
+            if (!s || Number(s.remoteAddress) !== addr) continue;
+            if (excludeShadeId != null && Number(s.shadeId) === Number(excludeShadeId)) continue;
+            return s.name || (`device #${s.shadeId}`);
+        }
+        const groups = this.groups || [];
+        for (let i = 0; i < groups.length; i++) {
+            const g = groups[i];
+            if (!g || Number(g.remoteAddress) !== addr) continue;
+            if (excludeGroupId != null && Number(g.groupId) === Number(excludeGroupId)) continue;
+            return g.name || (`group #${g.groupId}`);
+        }
+        return null;
     }
     saveGroup() {
         const g = get,
@@ -4618,7 +6221,7 @@ class Somfy {
 
         const checks = [
             [isNaN(obj.remoteAddress) || obj.remoteAddress < 1 || obj.remoteAddress > 16777215, 'ERR_REMOTE_ADDRESS_INVALID'],
-            [!obj.name || obj.name.length > 20, 'ERR_DEVIVE_NAME_INVALID']
+            [!obj.name || obj.name.length > 32, 'ERR_DEVIVE_NAME_INVALID']
         ];
         const error = checks.find(c => c[0]);
         if (error) return ui.errorMessage(tr(error[1]));
@@ -4769,9 +6372,7 @@ class Somfy {
 
             const svg = get('icoShade');
             if (svg) {
-                const pos = shade.flipPosition ? 100 - shade.position : shade.position;
-                svg.style.setProperty('--shade-position', pos);
-                svg.style.setProperty('--fpos', `${shade.position}%`);
+                this.applyShadeIconPosition(svg, shade.position, shade.flipPosition, shade.shadeType);
                 svg.setAttribute('data-shadeid', shade.shadeId);
             }
 
@@ -4798,9 +6399,7 @@ class Somfy {
 
             const svg = get('icoShade');
             if (svg) {
-                const pos = shade.flipPosition ? 100 - shade.position : shade.position;
-                svg.style.setProperty('--shade-position', pos);
-                svg.style.setProperty('--fpos', `${shade.position}%`);
+                this.applyShadeIconPosition(svg, shade.position, shade.flipPosition, shade.shadeType);
                 svg.setAttribute('data-shadeid', shade.shadeId);
             }
 
@@ -4875,10 +6474,14 @@ class Somfy {
                 if (shade.paired) {
                     get('btnUnpairShade').style.display = 'inline-block';
                     get('btnPairShade').style.display = 'none';
+                    if (get('btnForceUnpairShade')) get('btnForceUnpairShade').style.display = 'none';
+                    if (get('divRemoteIdTip')) get('divRemoteIdTip').style.display = 'none';
                 }
                 else {
                     get('btnPairShade').style.display = 'inline-block';
                     get('btnUnpairShade').style.display = 'none';
+                    if (get('btnForceUnpairShade')) get('btnForceUnpairShade').style.display = 'inline-block';
+                    if (get('divRemoteIdTip')) get('divRemoteIdTip').style.display = 'block';
                 }
                 this.setLinkedRemotesList(shade);
                 closeOverlay(div);
@@ -4903,37 +6506,44 @@ class Somfy {
             return (r === sk) ? tr(fk) : r;
         };
         const it = (n, s, l) => `<div class="step-item"><div class="step-number">${n}</div><div class="step-text">${t(s, l)}</div></div>`;
-        const inf = (s, l) => `<div class="information wizard-step" data-stepid="${s}"><svg><use href=#svg-info></use></svg><div><b>${tr("MSG_NOTE")}</b><span>${t(s, l)}</span></div></div>`;
 
         let div = document.createElement('div');
-        div.className = `inst-overlay wizard${ui.isExpertMode ? ' is-expert' : ''}`;
+        div.className = `inst-overlay wizard pair-wiz${ui.isExpertMode ? ' is-expert' : ''}`;
         div.id = 'divPairing';
         div.setAttribute('data-stepid', '1');
         div.setAttribute('data-type', 'link-remote');
         div.setAttribute('data-shadeid', shadeId);
 
         div.innerHTML = `
-        <div class="instructions-content">
+        <div class="instructions-content pair-wiz-content">
         <div class="overlay-scroll-content">
-        ${overlayHeader(isUnpair ? "UNPAIR_TITLE" : "PAIR_TITLE", tr(descKey), isG ? "svg-simpleGarage" : "svg-simpleShutter", 1)}
+        <div class="overlay-header"><div class="expert-mode-container"><span class="expert-label">${tr("BT_EXPERT_MODE")}</span><span class="switch expert-switch"><input id="cbExpertMode" type="checkbox" ${ui.isExpertMode ? 'checked' : ''} onchange="ui.toggleExpertMode(this.closest('.inst-overlay'));" onclick="event.stopPropagation();"><div></div></span></div><div close onclick="closeOverlay(this.closest('.inst-overlay'))"><svg class="closeShow-desktop"><use href=#svg-close></use></svg></div></div>
+        <div class="pair-wiz-hero">
+        <span class="pair-wiz-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><use href=#${isG ? 'svg-simpleGarage' : 'svg-simpleShutter'}></use></svg></span>
+        <div class="pair-wiz-titles">
+        <h2>${tr(isUnpair ? 'UNPAIR_TITLE' : 'PAIR_TITLE')}</h2>
+        <p>${tr(descKey)}</p>
+        </div>
+        </div>
         ${wizardStepper(stepTitles)}
-        <div class="blocsteps">
-        <div class="uniblocStep wizard-step" data-stepid="1">
-        ${it('a', 1, 1)} ${it('b', 1, 2)} ${isG ? it('c', 1, 3) : ''}
+        <div class="blocsteps pair-wiz-steps">
+        <div class="uniblocStep wizard-step pair-wiz-card" data-stepid="1">
+        ${it('1', 1, 1)} ${it('2', 1, 2)} ${isG ? it('3', 1, 3) : ''}
+        ${!isG ? `<div class="pair-wiz-note">${t(1, 3)}</div>` : ''}
         </div>
-        ${!isG ? inf(1, 3) : ''}
-        <div class="button-container-col wizard-step marginB" data-expert data-stepid="2">
-        <button id="${progId}" type="button">${tr("BT_PROG")}</button>
+        <div class="button-container-col wizard-step marginB pair-wiz-action" data-expert data-stepid="2">
+        <button id="${progId}" type="button" class="pair-wiz-prog">${tr("BT_PROG")}</button>
+        <span class="pair-wiz-prog-hint">${t(2, 1)}</span>
         </div>
-        <div class="uniblocStep wizard-step" data-stepid="2">
-        ${it('a', 2, 1)} ${it('b', 2, 2)} ${!isG ? it('c', 2, 3) : ''}
+        <div class="uniblocStep wizard-step pair-wiz-card" data-stepid="2">
+        ${it('1', 2, 1)} ${it('2', 2, 2)} ${!isG ? it('3', 2, 3) : ''}
+        ${!isG ? `<div class="pair-wiz-note">${t(2, 4)}</div>` : ''}
         </div>
-        ${!isG ? inf(2, 4) : ''}
-        <div class="button-container-col wizard-step marginB" data-expert data-stepid="3">
+        <div class="button-container-col wizard-step marginB pair-wiz-action" data-expert data-stepid="3">
         <button id="btnWizMarkSuc" type="button" class="btn-success" onclick="${sucAction}">${tr(isUnpair ? "BT_UNPAIRING_SUCCESS" : "BT_PAIRING_SUCCESS")}</button>
         </div>
-        <div class="uniblocStep wizard-step" data-stepid="3">${it('a', 3, 1)}</div>
-        <div class="empty-state wizard-step" data-stepid="3"><svg class="empty-icon"><use href=#svg-succes></use></svg></div>
+        <div class="uniblocStep wizard-step pair-wiz-card" data-stepid="3">${it('1', 3, 1)}</div>
+        <div class="empty-state wizard-step pair-wiz-done" data-stepid="3"><svg class="empty-icon"><use href=#svg-succes></use></svg></div>
         </div>
         </div>
         <div class="hrDivFooter"></div>
@@ -4976,6 +6586,14 @@ class Somfy {
     unpairShade(shadeId) {
         return this._shWiz(shadeId, true);
     }
+    _handleCommandAck(err, payload, cb) {
+        if (err) {
+            ui.serviceError(err);
+            if (typeof cb === 'function') cb(err, null);
+            return;
+        }
+        if (typeof cb === 'function') cb(null, payload);
+    }
     sendCommand(shadeId, command, repeat, cb) {
         let obj = {};
         if (typeof shadeId.shadeId !== 'undefined') {
@@ -4991,8 +6609,15 @@ class Somfy {
             else obj.target = parseInt(command, 10);
             if (typeof repeat === 'number') obj.repeat = parseInt(repeat);
         }
+        // My while moving must halt — same as HA cover Stop (not favorite).
+        if (String(obj.command || '').toLowerCase() === 'my') {
+            const el = document.querySelector(`.somfyShadeCtl[data-shadeid="${obj.shadeId}"]`);
+            const dir = el ? parseInt(el.getAttribute('data-direction'), 10) : 0;
+            const tiltDir = el ? parseInt(el.getAttribute('data-tiltdirection') || '0', 10) : 0;
+            if (dir !== 0 || tiltDir !== 0) obj.command = 'stop';
+        }
         putJSON('/shadeCommand', obj, (err, shade) => {
-            if (typeof cb === 'function') cb(err, shade);
+            this._handleCommandAck(err, shade, cb);
         });
     }
     sendCommandRepeat(shadeId, command, repeat, cb) {
@@ -5025,6 +6650,7 @@ class Somfy {
         let pnl = get('divVirtualRemote');
         let dd = pnl.querySelector('#selVRMotor');
         let opt = dd.selectedOptions[0];
+        if (!opt) return;
         let o = {
             type: opt.getAttribute('data-type'),
             address: opt.getAttribute('data-address'),
@@ -5065,18 +6691,169 @@ class Somfy {
         else
             somfy.sendCommand(o, (err, shade) => { fnRepeatCommand(err, shade); });
     }
+    sendRemoteAddressCommand(address, command, bitLength, repeats, cb) {
+        const body = {
+            address: parseInt(address, 10),
+            command: command || 'prog',
+            repeats: (typeof repeats === 'number') ? repeats : 1,
+            bitLength: bitLength || 56
+        };
+        putJSON('/sendRemoteCommand', body, (err, res) => {
+            if (err) ui.serviceError(err);
+            if (typeof cb === 'function') cb(err, res);
+        });
+    }
+    forceUnpairShade(shadeId) {
+        const target = (this.shades || []).find(s => Number(s.shadeId) === Number(shadeId));
+        if (!target) return ui.errorMessage(tr('ERR_SHADE_ID_REQUIRED'));
+        const others = (this.shades || []).filter(s => Number(s.shadeId) !== Number(shadeId));
+        if (!others.length) {
+            return ui.errorMessage(tr('ERR_FORCE_UNPAIR_NO_HOST'));
+        }
+
+        const clearT = () => { if (this.btnTimer) { clearTimeout(this.btnTimer); this.btnTimer = null; } };
+        let div = document.createElement('div');
+        div.className = `inst-overlay wizard${ui.isExpertMode ? ' is-expert' : ''}`;
+        div.id = 'divForceUnpair';
+        div.setAttribute('data-stepid', '1');
+        div.setAttribute('data-shadeid', shadeId);
+
+        const stepTitles = [
+            'FORCE_UNPAIR_TITLE_STEP1',
+            'FORCE_UNPAIR_TITLE_STEP2',
+            'FORCE_UNPAIR_TITLE_STEP3',
+            'FORCE_UNPAIR_TITLE_STEP4'
+        ];
+        const it = (n, key) => `<div class="step-item"><div class="step-number">${n}</div><div class="step-text">${tr(key)}</div></div>`;
+        const inf = (step, key) => `<div class="information wizard-step" data-stepid="${step}"><svg><use href=#svg-info></use></svg><div><b>${tr("MSG_NOTE")}</b><span>${tr(key)}</span></div></div>`;
+
+        div.innerHTML = `
+        <div class="instructions-content">
+        <div class="overlay-scroll-content">
+        ${overlayHeader('FORCE_UNPAIR_TITLE', tr('FORCE_UNPAIR_DESC').replace('%1', String(target.remoteAddress)), 'svg-warning', 1)}
+        ${wizardStepper(stepTitles)}
+        <div class="blocsteps">
+        ${inf(1, 'FORCE_UNPAIR_STEP_1_NOTE')}
+        <div class="uniblocStep wizard-step" data-stepid="1">
+        ${it('a', 'FORCE_UNPAIR_STEP_1_A')}
+        ${it('b', 'FORCE_UNPAIR_STEP_1_B')}
+        </div>
+        <div class="unibloc wizard-step" data-expert data-stepid="2">
+        <label class="label" for="selForceUnpairHost">${tr('FORCE_UNPAIR_SELECT_HOST')}</label>
+        <select id="selForceUnpairHost" class="inputAndSelect"></select>
+        <div class="uniStatus" style="margin-top:6px;">${tr('FORCE_UNPAIR_SELECT_HOST_HINT').replace('%1', String(target.remoteAddress))}</div>
+        </div>
+        <div class="uniblocStep wizard-step" data-stepid="2">
+        ${it('a', 'FORCE_UNPAIR_STEP_2_A')}
+        ${it('b', 'FORCE_UNPAIR_STEP_2_B')}
+        </div>
+        <div class="blocsteps-row wizard-step" data-expert data-stepid="3">
+        <div class="divWizShadeName" id="spanForceHostName"></div>
+        <button type="button" id="btnForceOpenMemory">${tr('BT_OPEN_MEMORY')}</button>
+        </div>
+        <div class="uniblocStep wizard-step" data-stepid="3">
+        ${it('a', 'FORCE_UNPAIR_STEP_3_A')}
+        ${it('b', 'FORCE_UNPAIR_STEP_3_B')}
+        </div>
+        ${inf(3, 'FORCE_UNPAIR_STEP_3_NOTE')}
+        <div class="blocsteps-row wizard-step" data-expert data-stepid="4">
+        <div>${tr('REMOTE_ID')}: <b>${target.remoteAddress}</b></div>
+        <button type="button" id="btnForceSendUnpair">${tr('BT_FORCE_UNPAIR_SEND')}</button>
+        </div>
+        <div class="uniblocStep wizard-step" data-stepid="4">
+        ${it('a', 'FORCE_UNPAIR_STEP_4_A')}
+        ${it('b', 'FORCE_UNPAIR_STEP_4_B')}
+        <div class="empty-state"><svg class="empty-icon"><use href=#svg-succes></use></svg></div>
+        </div>
+        </div>
+        </div>
+        <div class="hrDivFooter"></div>
+        <div class="expert-only-buttons" data-expert>
+        <button type="button" line onclick="closeOverlay(this.closest('.inst-overlay'))">${tr('BT_CANCEL_1')}</button>
+        </div>
+        <div class="button-container-overlay">
+        <button id="btnWizStop" class="wizard-step" data-stepid="1" line type="button">${tr('BT_CANCEL_1')}</button>
+        <button id="btnWizPrev" class="wizard-step" data-mstepid="2,3,4" line type="button" onclick="ui.wizSetPrevStep(this.closest('.wizard'));">${tr('BT_GO_BACK')}</button>
+        <button id="btnWizNext" class="wizard-step" data-mstepid="1,2,3" type="button" onclick="ui.wizSetNextStep(this.closest('.wizard'));">${tr('BT_NEXT')}</button>
+        <button id="btnWizEnd" class="wizard-step" data-stepid="4" type="button">${tr('BT_CLOSE')}</button>
+        </div>
+        </div>`;
+
+        const sel = div.querySelector('#selForceUnpairHost');
+        others.forEach(s => {
+            const opt = new Option(`${s.name} (ID ${s.remoteAddress})`, s.shadeId);
+            opt.setAttribute('data-bitlength', s.bitLength || 56);
+            sel.options.add(opt);
+        });
+        const syncHostName = () => {
+            const o = sel.options[sel.selectedIndex];
+            div.querySelectorAll('#spanForceHostName, .divWizShadeName').forEach(el => {
+                if (el) el.textContent = o ? o.text : '';
+            });
+        };
+        sel.onchange = syncHostName;
+        syncHostName();
+
+        div.querySelectorAll('#btnWizStop, #btnWizEnd').forEach(btn => {
+            btn.onclick = () => closeOverlay(div, clearT);
+        });
+
+        div.querySelector('#btnForceOpenMemory').onclick = () => {
+            const hostId = parseInt(sel.value, 10);
+            putJSONSync('/shadeCommand', { shadeId: hostId, command: 'prog', repeat: 40 }, (err) => {
+                if (err) return ui.serviceError(err);
+                let prompt = ui.promptMessage(tr('PROMPT_CONFIRM_MOTOR_RESPONSE'), () => {
+                    ui.wizSetNextStep(div);
+                    closeOverlay(prompt);
+                });
+                prompt.querySelector('.sub-message').innerHTML =
+                    `<p>${tr('PROMPT_SHADE_MOVE_CONFIRM')}</p><p>${tr('FORCE_UNPAIR_MEMORY_READY')}</p>`;
+            });
+        };
+
+        div.querySelector('#btnForceSendUnpair').onclick = () => {
+            const bit = target.bitLength || 56;
+            const repeats = (Number(bit) === 56) ? 7 : 1;
+            // Transmit THIS shade's Remote ID (e.g. 872484), not the host motor's ID.
+            this.sendRemoteAddressCommand(target.remoteAddress, 'prog', bit, repeats, (err) => {
+                if (err) return;
+                let prompt = ui.promptMessage(tr('PROMPT_CONFIRM_MOTOR_RESPONSE'), () => {
+                    putJSONSync('/setPaired', { shadeId: shadeId, paired: false }, () => {});
+                    closeOverlay(prompt);
+                    closeOverlay(div, clearT);
+                    ui.successMessage(tr('MSG_FORCE_UNPAIR_DONE'));
+                    this.openEditShade(shadeId);
+                });
+                prompt.querySelector('.sub-message').innerHTML =
+                    `<p>${tr('PROMPT_SHADE_MOVE_CONFIRM')}</p><p>${tr('FORCE_UNPAIR_LINK_DONE')}</p>`;
+            });
+        };
+
+        ui.wizSetStep(div, 1);
+        shOverlay(div, clearT);
+        return div;
+    }
     sendSetSensor(obj, cb) {
         putJSON('/setSensor', obj, (err, device) => {
             if (typeof cb === 'function') cb(err, device);
         });
     }
-    sendGroupCommand(groupId, command, repeat, cb) {
-        console.log(`Sending Group command ${groupId}-${command}`);
+    sendGroupCommand(groupId, command, repeat, cb, rf) {
         let obj = { groupId: groupId };
         if (isNaN(parseInt(command, 10))) obj.command = command;
         if (typeof repeat === 'number') obj.repeat = parseInt(repeat);
+        if (rf) {
+            if (rf.bitLength) obj.bitLength = rf.bitLength;
+            if (typeof rf.proto !== 'undefined') obj.proto = rf.proto;
+        }
+        // My while group is moving → stop (never favorite mid-travel).
+        if (String(obj.command || '').toLowerCase() === 'my') {
+            const el = document.querySelector(`.somfyGroupCtl[data-groupid="${groupId}"]`);
+            const dir = el ? parseInt(el.getAttribute('data-direction') || '0', 10) : 0;
+            if (dir !== 0) obj.command = 'stop';
+        }
         putJSON('/groupCommand', obj, (err, group) => {
-            if (typeof cb === 'function') cb(err, group);
+            this._handleCommandAck(err, group, cb);
         });
     }
     sendTiltCommand(shadeId, command, cb) {
@@ -5247,8 +7024,40 @@ class Somfy {
         const hP = div.querySelector('.instructions-header p');
         if (hP) hP.innerHTML += ' <span id="spanGroupName" class="groupNameSpan"></span>';
 
+        // Pair PROG uses the group remote address. Pass the selected shade's RF mode
+        // as a one-shot override (do not rewrite the saved group settings).
+        let wizGroup = null;
+        let wizAvail = [];
+        let wizLinked = [];
+        let wizPairRf = null;
+        const selectedShadeId = () => {
+            if (isUnlink) return shadeId;
+            const sel = div.querySelector('#selAvailShades');
+            if (sel && sel.value !== '') return parseInt(sel.value, 10);
+            const v = ui.fromElement(div).shadeId;
+            return v !== undefined && v !== null && v !== '' ? parseInt(v, 10) : NaN;
+        };
+        const findShadeMeta = (id) => {
+            const sid = Number(id);
+            return wizAvail.find(s => Number(s.shadeId) === sid)
+                || wizLinked.find(s => Number(s.shadeId) === sid)
+                || null;
+        };
+        const rfForShade = (sId) => {
+            const shade = findShadeMeta(sId);
+            if (!shade) return null;
+            return {
+                bitLength: shade.bitLength || 56,
+                proto: (typeof shade.proto !== 'undefined') ? shade.proto : 0
+            };
+        };
+
         div.querySelector('#btnOpenMemory').onclick = () => {
-            const sId = isUnlink ? shadeId : ui.fromElement(div).shadeId;
+            const sId = selectedShadeId();
+            if (Number.isNaN(sId)) {
+                ui.errorMessage(tr('MSG_ALERT')).querySelector('.sub-message').innerHTML = tr('LINK_GROUP_SELECT_SHADE');
+                return;
+            }
             putJSONSync('/shadeCommand', { shadeId: sId, command: 'prog', repeat: 40 }, (err) => {
                 if (err) ui.serviceError(err);
                 else {
@@ -5273,7 +7082,10 @@ class Somfy {
         };
         if (isUnlink) {
             btnAction.onclick = () => {
-                putJSONSync('/groupCommand', { groupId: groupId, command: 'prog', repeat: 1 }, (err) => {
+                const rf = rfForShade(shadeId);
+                const body = { groupId: groupId, command: 'prog', repeat: 1 };
+                if (rf) { body.bitLength = rf.bitLength; body.proto = rf.proto; }
+                putJSONSync('/groupCommand', body, (err) => {
                     if (err) ui.serviceError(err);
                     else {
                         let prompt = ui.promptMessage(tr('PROMPT_CONFIRM_MOTOR_RESPONSE'), () => {
@@ -5290,14 +7102,16 @@ class Somfy {
             };
         } else {
             btnAction.onmousedown = () => {
+                const sId = selectedShadeId();
                 mouseDown = true;
-                somfy.sendGroupCommand(groupId, 'prog', null, fnRepeat);
+                wizPairRf = rfForShade(sId);
+                somfy.sendGroupCommand(groupId, 'prog', null, fnRepeat, wizPairRf);
             };
             btnAction.onmouseup = () => {
                 mouseDown = false;
-                let obj = ui.fromElement(div);
+                const sId = selectedShadeId();
                 let prompt = ui.promptMessage(tr('PROMPT_CONFIRM_MOTOR_RESPONSE'), () => {
-                    putJSONSync('/linkToGroup', { groupId: groupId, shadeId: obj.shadeId }, (err, group) => {
+                    putJSONSync('/linkToGroup', { groupId: groupId, shadeId: sId }, (err, group) => {
                         somfy.setLinkedShadesList(group);
                         this.updateGroupList();
                     });
@@ -5315,9 +7129,11 @@ class Somfy {
             }
             let canShow = false;
             const spanName = div.querySelector('#spanGroupName');
+            wizGroup = data;
+            wizLinked = data.linkedShades || [];
 
             if (isUnlink) {
-                const shade = data.linkedShades.find(x => x.shadeId === shadeId);
+                const shade = (data.linkedShades || []).find(x => Number(x.shadeId) === Number(shadeId));
                 if (shade) {
                     if (spanName) spanName.innerHTML = data.name;
                     div.querySelectorAll('.divWizShadeName').forEach(el => el.innerHTML = shade.name);
@@ -5327,9 +7143,15 @@ class Somfy {
                 }
             } else {
                 if (data.availShades && data.availShades.length > 0) {
+                    wizAvail = data.availShades;
                     if (spanName) spanName.innerHTML = data.name;
                     let selAvail = div.querySelector('#selAvailShades');
-                    data.availShades.forEach(s => selAvail.options.add(new Option(s.name, s.shadeId)));
+                    data.availShades.forEach(s => {
+                        const opt = new Option(s.name, s.shadeId);
+                        opt.setAttribute('data-bitlength', s.bitLength);
+                        opt.setAttribute('data-proto', s.proto);
+                        selAvail.options.add(opt);
+                    });
                     div.querySelectorAll('.divWizShadeName').forEach(el => el.innerHTML = data.availShades[0].name);
                     canShow = true;
                 } else {
@@ -5416,43 +7238,37 @@ class Somfy {
         let shade = document.querySelector(`div.somfyShadeCtl[data-shadeid="${shadeId}"]`);
         if (!shade) return;
 
-        let arrowUse = shade.querySelector('.handle-icon use');
         let existing = shade.querySelector('.shade-positioner');
-
         if (existing) {
-            existing.classList.add('popup-slide-out');
-            if (arrowUse) arrowUse.setAttribute('href', '#svg-arrowRight');
-            setTimeout(() => { existing.remove(); }, 300);
+            this.dismissPositioners();
             return;
         }
-        document.querySelectorAll('.shade-positioner').forEach(el => {
-            el.remove();
-            document.querySelectorAll('.handle-icon use').forEach(u => u.setAttribute('href', '#svg-arrowRight'));
-        });
-        switch (parseInt(shade.getAttribute('data-shadetype'), 10)) {
-            case 5: case 9: case 10: case 14: case 15: case 16: return;
-        }
+        this.dismissPositioners(false);
+        if (!this.canSetPosition(shade.getAttribute('data-shadetype'))) return;
 
         let tiltType = parseInt(shade.getAttribute('data-tilt'), 10) || 0;
         let currPos = parseInt(shade.getAttribute('data-target'), 10) || 0;
         let currTiltPos = parseInt(shade.getAttribute('data-tilttarget'), 10) || 0;
-        let lbl = makeBool(shade.getAttribute('data-flipposition')) ? `% ${tr('POPUP_OPEN')}` : `% ${tr('POPUP_CLOSED')}`;
+        const myPos = parseInt(shade.getAttribute('data-mypos'), 10);
+        const scaleHint = tr('POPUP_POS_SCALE') || '100% open · 0% closed';
 
         const positionSlider = (tiltType !== 3) ? `
         <div class="slider-group">
         <div class="slider-header">
         <span class="title">${tr('POPUP_TARGET_POSITION')}</span>
-        <span class="val"><span id="spanShadeTarget" class="shade-target">${currPos}</span> ${lbl}</span>
+        <span class="val"><span id="spanShadeTarget" class="shade-target">${currPos}</span>%</span>
         </div>
+        <div class="uniStatus pos-scale-hint">${scaleHint}</div>
         <input id="slidShadeTarget" name="shadeTarget" type="range" min="0" max="100" step="1" value="${currPos}" onchange="somfy.processShadeTarget(this, ${shadeId});" oninput="get('spanShadeTarget').innerHTML = this.value;" />
         </div>` : '';
 
         const tiltSlider = (tiltType > 0) ? `
-        <div class="slider-group" ${(tiltType !== 3) ? 'style="margin-top:10px;"' : ''}>
+        <div class="slider-group">
         <div class="slider-header">
         <span class="title">${tr('POPUP_TARGET_TILT_POSITION')}</span>
-        <span class="val"><span id="spanShadeTiltTarget" class="shade-tilt-target">${currTiltPos}</span> ${lbl}</span>
+        <span class="val"><span id="spanShadeTiltTarget" class="shade-tilt-target">${currTiltPos}</span>%</span>
         </div>
+        <div class="uniStatus pos-scale-hint">${scaleHint}</div>
         <input id="slidShadeTiltTarget" name="shadeTarget" type="range" min="0" max="100" step="1" value="${currTiltPos}" onchange="somfy.processShadeTiltTarget(this, ${shadeId});" oninput="get('spanShadeTiltTarget').innerHTML = this.value;" />
         </div>` : '';
 
@@ -5463,25 +7279,19 @@ class Somfy {
 
         div.innerHTML = `
         <div class="shade-positioner-inner">
+        <button type="button" class="pos-close" aria-label="${tr('BT_CANCEL_1') || 'Close'}"><svg class="icon-svg"><use href="#svg-close"></use></svg></button>
         ${positionSlider}
         ${tiltSlider}
+        ${myPos >= 0 ? `<div class="popup-actions"><button type="button" id="btnGoMy">${tr('HOME_GO_MY') || 'Go to My'}</button></div>` : ''}
         </div>`;
 
         shade.appendChild(div);
-        if (arrowUse) arrowUse.setAttribute('href', '#svg-arrowLeft');
+        const elClose = div.querySelector('.pos-close');
+        if (elClose) elClose.onclick = (e) => { e.preventDefault(); e.stopPropagation(); this.dismissPositioners(); };
+        const elGoMy = div.querySelector('#btnGoMy');
+        if (elGoMy) elGoMy.onclick = (e) => { e.preventDefault(); e.stopPropagation(); this.dismissPositioners(); this.sendCommand(shadeId, 'my'); };
 
-        document.body.addEventListener('click', () => {
-            let ctls = document.querySelectorAll('.shade-positioner');
-            ctls.forEach(ctl => {
-                ctl.classList.add('popup-slide-out');
-                let parentShade = ctl.closest('.somfyShadeCtl');
-                if (parentShade) {
-                    let u = parentShade.querySelector('.handle-icon use');
-                    if (u) u.setAttribute('href', '#svg-arrowRight');
-                }
-                setTimeout(() => { ctl.remove(); }, 300);
-            });
-        }, { once: true });
+        document.body.addEventListener('click', () => this.dismissPositioners(), { once: true });
     }
 }
 var somfy = new Somfy();
@@ -5540,9 +7350,190 @@ class MQTT {
     }
 }
 var mqtt = new MQTT();
+class AlexaPage {
+    maxDevices = 24;
+    enabled = false;
+    loadPage() {
+        getJSONSync('/modulesettings', (err2, settings) => {
+            if (!err2 && settings) {
+                this.enabled = !!settings.alexaHueEnabled;
+                if (typeof settings.alexaHueMax === 'number') this.maxDevices = settings.alexaHueMax;
+                if (typeof general !== 'undefined') general.general = Object.assign(general.general || {}, settings);
+                const cb = get('cbAlexaHueEnabled');
+                if (cb) cb.checked = this.enabled;
+            }
+            // Always refresh shades so device-editor toggles and this page stay in sync.
+            getJSONSync('/shades', (err, shades) => {
+                if (!err && Array.isArray(shades) && typeof somfy !== 'undefined')
+                    somfy.shades = shades;
+                this.renderList();
+            });
+        });
+    }
+    setEnabled(on) {
+        putJSONSync('/setgeneral', { alexaHueEnabled: !!on }, (err) => {
+            if (err) return ui.serviceError(err);
+            this.enabled = !!on;
+            if (typeof general !== 'undefined' && general.general)
+                general.general.alexaHueEnabled = this.enabled;
+            this.refreshCount();
+        });
+    }
+    refreshCount() {
+        const el = get('spanAlexaHueCount');
+        if (!el) return;
+        const n = (somfy.shades || []).filter(s => s && s.exposeAlexa).length;
+        const max = this.maxDevices || 24;
+        el.textContent = (typeof tr === 'function' ? tr('ALEXA_HUE_COUNT') : 'Alexa lights: %1 / %2')
+            .replace('%1', String(n)).replace('%2', String(max));
+        if (typeof general !== 'undefined' && general.general) {
+            general.general.alexaHueCount = n;
+            general.general.alexaHueMax = max;
+        }
+    }
+    canExposeMore() {
+        const n = (somfy.shades || []).filter(s => s && s.exposeAlexa).length;
+        return n < (this.maxDevices || 24);
+    }
+    eligibleShade(s) {
+        if (!s || s.shadeId == null || Number(s.shadeId) >= 255) return false;
+        const t = parseInt(s.shadeType != null ? s.shadeType : s.type, 10);
+        if (Number.isNaN(t)) return true;
+        return t !== 9 && t !== 10;
+    }
+    shadeLabel(s) {
+        return s.name || (`#${s.shadeId}`);
+    }
+    shadeRoom(s) {
+        const rooms = (typeof _rooms !== 'undefined' && _rooms.length) ? _rooms
+            : ((typeof somfy !== 'undefined' && somfy.rooms) ? somfy.rooms : []);
+        const room = rooms.find(r => Number(r.roomId) === Number(s.roomId));
+        return (room && room.name) ? room.name : '';
+    }
+    allEligible() {
+        return (somfy.shades || []).filter(s => this.eligibleShade(s))
+            .slice().sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+    }
+    applyLocalExpose(shadeId, want) {
+        const id = Number(shadeId);
+        const list = somfy.shades || [];
+        for (let i = 0; i < list.length; i++) {
+            if (Number(list[i].shadeId) === id) {
+                list[i].exposeAlexa = want;
+                return;
+            }
+        }
+    }
+    renderList() {
+        const list = get('divAlexaShadeList');
+        const empty = get('divAlexaShadeEmpty');
+        if (!list) return;
+
+        const eligible = this.allEligible();
+        const atCap = !this.canExposeMore();
+        list.innerHTML = '';
+
+        eligible.forEach(s => {
+            const on = !!s.exposeAlexa;
+            const room = this.shadeRoom(s);
+            const row = document.createElement('label');
+            row.className = 'uniRow alexa-shade-row' + (on ? ' is-on-alexa' : '');
+            row.innerHTML = `
+                <div class="uniText">
+                    <div class="uniLabel"></div>
+                    <div class="uniStatus"></div>
+                </div>
+                <div class="uniRight">
+                    <span class="switch">
+                        <input type="checkbox"${on ? ' checked' : ''}${(!on && atCap) ? ' disabled' : ''}/>
+                        <div></div>
+                    </span>
+                </div>`;
+            row.querySelector('.uniLabel').textContent = this.shadeLabel(s);
+            const status = on
+                ? (tr('ALEXA_STATUS_ON') || 'On Alexa')
+                : (tr('ALEXA_STATUS_OFF') || 'Not on Alexa');
+            row.querySelector('.uniStatus').textContent = room ? `${room} · ${status}` : status;
+            const cb = row.querySelector('input');
+            cb.addEventListener('change', () => {
+                const want = !!cb.checked;
+                if (want && !this.canExposeMore()) {
+                    cb.checked = false;
+                    return ui.errorMessage(get('divAlexa') || document.body,
+                        (tr('ALEXA_AT_CAP') || 'Alexa limit reached (%1).').replace('%1', String(this.maxDevices)));
+                }
+                this.setShadeExpose(s.shadeId, want, cb);
+            });
+            list.appendChild(row);
+        });
+
+        if (empty) empty.style.display = eligible.length ? 'none' : '';
+        this.refreshCount();
+    }
+    setShadeExpose(shadeId, expose, cbEl) {
+        const want = !!expose;
+        if (want && !this.canExposeMore()) {
+            if (cbEl) cbEl.checked = false;
+            return ui.errorMessage(get('divAlexa') || document.body,
+                (tr('ALEXA_AT_CAP') || 'Alexa limit reached (%1).').replace('%1', String(this.maxDevices)));
+        }
+        putJSONSync('/saveShade', { shadeId: Number(shadeId), exposeAlexa: want }, (err, shade) => {
+            if (err) {
+                if (cbEl) cbEl.checked = !want;
+                return ui.serviceError(err);
+            }
+            this.applyLocalExpose(shadeId, want);
+            if (shade && typeof shade === 'object') {
+                const idx = (somfy.shades || []).findIndex(s => Number(s.shadeId) === Number(shadeId));
+                if (idx >= 0) {
+                    somfy.shades[idx] = Object.assign(somfy.shades[idx], shade);
+                    somfy.shades[idx].exposeAlexa = want;
+                }
+            }
+            this.renderList();
+        });
+    }
+}
+var alexa = new AlexaPage();
 class Firmware {
     initialized = false;
+    _updateBusy = false;
+    _busyGuard = null;
     init() { this.initialized = true; }
+    isUpdateBusy() { return !!this._updateBusy; }
+    setUpdateBusy(busy) {
+        const on = !!busy;
+        this._updateBusy = on;
+        document.documentElement.classList.toggle('fw-update-busy', on);
+        const lockClose = (root) => {
+            if (!root) return;
+            root.classList.toggle('fw-update-locked', on);
+            root.querySelectorAll('[close]').forEach(el => {
+                el.style.pointerEvents = on ? 'none' : '';
+                el.style.opacity = on ? '0.35' : '';
+                el.style.cursor = on ? 'not-allowed' : '';
+            });
+        };
+        lockClose(get('divUploadFile'));
+        lockClose(get('divGitInstall'));
+        if (on && !this._busyGuard) {
+            this._busyGuard = (e) => {
+                const root = get('divUploadFile') || get('divGitInstall');
+                if (!root) return;
+                if (root.contains(e.target)) return;
+                e.preventDefault();
+                e.stopPropagation();
+            };
+            document.addEventListener('click', this._busyGuard, true);
+            document.addEventListener('pointerdown', this._busyGuard, true);
+            document.addEventListener('keydown', this._busyGuard, true);
+        } else if (!on && this._busyGuard) {
+            document.removeEventListener('click', this._busyGuard, true);
+            document.removeEventListener('pointerdown', this._busyGuard, true);
+            document.removeEventListener('keydown', this._busyGuard, true);
+            this._busyGuard = null;
+        }
+    }
     isMobile() {
         let agt = navigator.userAgent.toLowerCase();
         return /Android|iPhone|iPad|iPod|BlackBerry|BB|PlayBook|IEMobile|Windows Phone|Kindle|Silk|Opera Mini/i.test(navigator.userAgent);
@@ -5615,6 +7606,8 @@ class Firmware {
         //[id, bind, texte, checked]
         const opts = [
             ['cbRestoreShades', 'shades', 'RESTORE_SHADES_GROUPS', 1],
+            ['cbRestoreFixedCodes', 'fixedCodes', 'RESTORE_RF_SWITCHES', 1],
+            ['cbRestoreAutomation', 'automation', 'RESTORE_SCENES_SCHEDULES', 1],
             ['cbRestoreRepeaters', 'repeaters', 'RESTORE_REPEATERS', 0],
             ['cbRestoreSystem', 'settings', 'RESTORE_SYSTEM_SETTINGS', 0],
             ['cbRestoreNetwork', 'network', 'RESTORE_NETWORK_SETTINGS', 0],
@@ -5641,7 +7634,7 @@ class Firmware {
         shOverlay(div);
     }
     createFileUploader(service) {
-        const isRestore = service === '/restore', isMob = this.isMobile(), div = document.createElement('div');
+        const isRestore = service === '/restore', isPkg = service === '/updatePackage', isMob = this.isMobile(), div = document.createElement('div');
         div.id = 'divUploadFile';
         div.className = 'inst-overlay';
 
@@ -5651,28 +7644,51 @@ class Firmware {
         <div class="v-step-right"><div>${content}</div></div>
         </div>`;
 
+        const uploadClick = isPkg
+            ? `firmware.uploadUpdatePackage(get('divUploadFile'))`
+            : `firmware.uploadFile('${service}',get('divUploadFile'),ui.fromElement(get('divUploadFile')))`;
+
+        const fileOnChange = isPkg
+            ? `firmware.onUpdatePackageSelected(this)`
+            : `const f=this.files[0];if(f){const s=get('span-selected-file');s.innerText=f.name;s.style.opacity='1';firmware.checkBackupVersion(f)}`;
+
+        const step1Text = isPkg ? tr('FW_UPDATE_PKG_STEP')
+            : tr(service === '/updateFirmware' ? 'FIRMWARE_UPDATE_SYSTEM' : 'FIRMWARE_UPDATE_LITTLEFS');
+
         div.innerHTML = `
         <div class="instructions-content">
         <div class="overlay-scroll-content">
         <form method="POST" action="#" enctype="multipart/form-data" id="frmUploadApp">
         <div id="divInstText"></div>
+        <div id="divUpdateTabGithub" class="update-tab-panel" style="display:none;"></div>
+        <div id="divUpdateTabLocal" class="update-tab-panel">
         <div class="vertical-steps-container">
         ${step(1, `
-        <div style="font-size:14px;">${tr(service === '/updateFirmware' ? 'FIRMWARE_UPDATE_SYSTEM' : 'FIRMWARE_UPDATE_LITTLEFS')}</div>
-        <a href="https://github.com/xkain/ESPSomfy-RTS/releases" target="_blank" class="link">${tr('FIRMWARE_UPDATE_FROM_GITHUB')}<svg class="svgInTextSmall"><use href="#svg-linkOut"></use></svg></a>
-        `, isRestore)}
+        <div style="font-size:14px;">${step1Text}</div>
+        <a href="https://github.com/jcvsite/ESPSomfy-RTS/releases" target="_blank" class="link">${tr('FIRMWARE_UPDATE_FROM_GITHUB')}<svg class="svgInTextSmall"><use href="#svg-linkOut"></use></svg></a>
+        `, isRestore || isPkg)}
         <div class="v-step-item ${isRestore ? '' : 'has-extra-content'}" style="${isRestore ? 'height:auto;margin:15px 0 0' : ''}">
         <div class="v-step-left" style="${isRestore ? 'display:none' : ''}">
         <div class="step-counter">2</div><div class="v-step-line"></div>
         </div>
         <div class="v-step-right" style="${isRestore ? 'padding-left:0' : ''}">
-        <input id="fileName" type="file" name="updateFS" style="display:none"
-        onchange="const f=this.files[0];if(f){const s=get('span-selected-file');s.innerText=f.name;s.style.opacity='1';firmware.checkBackupVersion(f)}"/>
+        <input id="fileName" type="file" name="updateFS" accept="${isPkg ? '.espsomfy,.bin,application/octet-stream' : ''}" style="display:none"
+        onchange="${fileOnChange}"/>
         <label for="fileName" class="custom-file-upload">
         <span id="span-selected-file" class="file-name-display">${tr('CHOOSE_FILE')}</span>
         <div class="file-icon-btn"><svg><use href="#svg-upload"></use></svg></div>
         </label>
         </div>
+        </div>
+        <div id="divPkgParts" class="pkg-parts" style="display:none;">
+        <div id="divPkgDeviceInfo" class="pkg-parts-info"></div>
+        <div id="divPkgInfo" class="pkg-parts-info"></div>
+        <div id="divPkgChipWarn" class="warningText" style="display:none;"></div>
+        <label class="pkg-check"><input type="checkbox" id="chkPkgSelectAll" onchange="firmware.onPkgSelectAllChanged(this.checked)"/><span>${tr('FW_UPDATE_PKG_SELECT_ALL')}</span></label>
+        <label class="pkg-check"><input type="checkbox" id="chkPkgFw" onchange="firmware.onPkgPartChanged()"/><span id="lblPkgFw">${tr('FW_UPDATE_PKG_PART_FW')}</span></label>
+        <label class="pkg-check"><input type="checkbox" id="chkPkgApp" onchange="firmware.onPkgPartChanged()"/><span id="lblPkgApp">${tr('FW_UPDATE_PKG_PART_APP')}</span></label>
+        <hr class="pkg-parts-sep"/>
+        <label class="pkg-check"><input type="checkbox" id="chkPkgClearCache" checked/><span>${tr('FW_UPDATE_PKG_CLEAR_CACHE')}</span></label>
         </div>
         <div class="v-step-item" style="${isRestore ? 'display:none' : ''}">
         <div class="v-step-left"><div class="step-counter">3</div></div>
@@ -5685,6 +7701,7 @@ class Firmware {
         </div>
         <div class="progress-bar" id="progFileUpload" style="display:none;margin:15px 0"></div>
         </div>
+        </div>
         <div class="hrDivFooter"></div>
         <div class="button-container-overlay"><div class="footer-sticky-content">
         <div class="uniRow backup-row" style="${isRestore ? 'display:none' : ''}">
@@ -5694,9 +7711,14 @@ class Firmware {
         </div>
         <div id="btnBackupCfg" class="gitBackup" onclick="firmware.backup()"><svg><use href="#svg-download"></use></svg></div>
         </div>
+        <label class="pkg-check" id="lblMeshUpdatePeers" style="display:none;">
+            <input type="checkbox" id="chkMeshUpdatePeers" checked/>
+            <span>${tr('MESH_UPDATE_PEERS') || 'Also update Repeaters'}</span>
+        </label>
         <div class="button-container-row">
         <button id="btnClose" line type="button" onclick="closeOverlay(get('divUploadFile'))">${tr('BT_CANCEL_1')}</button>
-        <button id="btnUploadFile" type="button" onclick="firmware.uploadFile('${service}',get('divUploadFile'),ui.fromElement(get('divUploadFile')))">${tr('BT_UPLOAD_FILE')}</button>
+        <button id="btnGitUpdate" type="button" class="btn-main" style="display:none;" disabled onclick="firmware.installGitRelease(get('divUploadFile'))">${tr('BT_UPDATE')}</button>
+        <button id="btnUploadFile" type="button"${isPkg ? ' disabled' : ''} onclick="${uploadClick}">${isPkg ? tr('BT_UPDATE') : tr('BT_UPLOAD_FILE')}</button>
         </div>
         </div></div>
         </form>
@@ -5739,87 +7761,83 @@ class Firmware {
     }
     procFwStatus(rel) {
         const divsGlobal = document.querySelectorAll('.firmware-message');
-        const divLocal = get('divSystemStatus');
-        const statusDesc = get('statusDesc');
+        const note = get('divOptionsFwNote');
+        const ver = rel.latest?.name || '';
+        const html = this.fwUpdateNoteHtml(ver);
+        const bindChanges = (root) => {
+            root.querySelectorAll('.fw-update-changes').forEach(el => {
+                el.onclick = (e) => {
+                    e.stopPropagation();
+                    const u = el.getAttribute('data-url');
+                    if (u) window.open(u, '_blank', 'noopener');
+                };
+            });
+        };
 
-        if (divsGlobal.length === 0) return;
         divsGlobal.forEach(div => {
             div.classList.remove('procFwStatusshow');
             div.onclick = null;
+            div.innerHTML = '';
         });
-        if (rel.available && rel.status === 0 && rel.checkForUpdate !== false) {
+        if (note) { note.style.display = 'none'; note.innerHTML = ''; }
+
+        if (rel.available && rel.status === 0 && ver) {
             divsGlobal.forEach(div => {
                 div.classList.add('procFwStatusshow');
                 div.style.cursor = 'pointer';
-                div.onclick = () => { firmware.updateGithub(); };
-                div.innerHTML = `<span>${tr('FW_UPDATE_AVAILABLE')}</span>`;
+                div.onclick = () => { firmware.updateManual(); };
+                div.innerHTML = html;
+                bindChanges(div);
             });
-            if (divLocal) {
-                divLocal.className = "error";
-                get('useStatusIcon')?.setAttribute('href', '#svg-error');
-                const st = get('statusTitle');
-                const currentMajor = this.getMainVersion(rel.appVersion?.name || get('spanFwVersion')?.innerText);
-                const targetMajor = this.getMainVersion(rel.latest?.name);
-                const isBlocked = (currentMajor < 3 && targetMajor >= 3) || (currentMajor >= 3 && targetMajor < 3);
-
-                if (st) st.innerHTML = tr(isBlocked ? 'FW_UPDATE_REQUIRED_USB' : 'FW_UPDATE_AVAILABLE');
-                statusDesc.innerHTML = isBlocked
-                ? tr('FW_UPDATE_USB_DESC').replace('%1', rel.latest.name)
-                : tr('FW_UPDATE_ACTION_DESC2').replace('%1', rel.latest.name);
-
-                divLocal.style.cursor = 'pointer';
-                divLocal.onclick = () => { firmware.updateGithub(); };
+            if (note) {
+                note.style.display = '';
+                note.innerHTML = html;
+                bindChanges(note);
             }
         }
-        else if (rel.status === 4 && rel.error !== 0) {
-            let e = errors.find(x => x.code === rel.error) || { desc: tr('ERR_UNSPECIFIED') };
-            let inst = get('divGitInstall');
+        else if (rel.status === 4) {
+            firmware.setUpdateBusy(false);
+            let inst = get('divGitInstall') || get('divUploadFile');
             if (inst) inst.remove();
-            ui.errorMessage(e.desc);
-        }
-        else {
-            if (divLocal) {
-                divLocal.className = "success";
-                get('useStatusIcon')?.setAttribute('href', '#svg-info');
-                const st = get('statusTitle');
-                if (st) st.innerHTML = tr('FW_UPDATE_UPTODATE');
-                statusDesc.innerHTML = tr('FW_UPDATE_ACTION_DESC');
-
-                divLocal.style.cursor = '';
-                divLocal.onclick = null;
+            if (typeof general !== 'undefined' && general.refreshVersions) general.refreshVersions();
+            if (rel.error !== 0) {
+                let e = errors.find(x => x.code === rel.error) || { desc: tr('ERR_UNSPECIFIED') };
+                ui.errorMessage(e.desc);
+            } else {
+                let title = `<svg><use xlink:href="#svg-succes"></use></svg>`;
+                let infoDiv = ui.errorMessage(title);
+                infoDiv.querySelector('.sub-message').innerHTML = `${tr('GIT_RELEASE_SUCCES_1')}<br>${tr('GIT_RELEASE_SUCCES_2')}`;
+                let btn = infoDiv.querySelector('button');
+                if (btn) {
+                    btn.innerText = tr('BT_RELOAD') || 'Reload';
+                    btn.onclick = function() { location.reload(); };
+                }
             }
         }
+    }
+    fwUpdateNoteHtml(ver) {
+        const url = `https://github.com/jcvsite/ESPSomfy-RTS/releases/tag/${encodeURIComponent(ver)}`;
+        return `<span>${tr('FW_UPDATE_AVAILABLE')}: ${ver}</span><span class="fw-update-changes" data-url="${url}">${tr('FW_UPDATE_CHANGES') || 'Changes'}</span>`;
     }
     procUpdateProgress(prog) {
         const pct = Math.round((prog.loaded / prog.total) * 100);
         general.reloadApp = true;
-        const git = get('divGitInstall');
+        const git = get('divGitInstall') || get('divUploadFile');
 
         if (git) {
-            if (pct >= 100 && prog.part === 100) {
-                git.remove();
-                let title = `<svg><use xlink:href="#svg-succes"></use></svg>`;
-                let infoDiv = ui.errorMessage(title);
-                infoDiv.querySelector('.sub-message').innerHTML = `${tr('GIT_RELEASE_SUCCES_1')}<br>${tr('GIT_RELEASE_SUCCES_2')}`;
+            // Do not treat FS progress 100% as success — wait for fwStatus COMPLETE + error 0
+            // (remount/restore may still fail after the download finishes).
+            if (prog.part === 100) {
+                const btnCancel = get('btnCancelUpdate');
+                if (btnCancel) btnCancel.style.display = 'none';
+            }
+            const p = (prog.part === 100) ?
+            get('progApplicationDownload') :
+            get('progFirmwareDownload');
 
-                let btn = infoDiv.querySelector('button');
-                if (btn) {
-                    btn.innerText = tr('BT_RELOAD') || "Recharger la page";
-                    btn.onclick = function() { location.reload(); };
-                }
-            } else {
-                if (prog.part === 100) {
-                    const btnCancel = get('btnCancelUpdate');
-                    if (btnCancel) btnCancel.style.display = 'none';
-                }
-                const p = (prog.part === 100) ?
-                get('progApplicationDownload') :
-                get('progFirmwareDownload');
-
-                if (p) {
-                    p.style.setProperty('--progress', `${pct}%`);
-                    p.setAttribute('data-progress', `${pct}%`);
-                }
+            if (p) {
+                p.style.setProperty('--progress', `${pct}%`);
+                p.setAttribute('data-progress', `${pct}%`);
             }
         }
     }
@@ -5831,8 +7849,11 @@ class Firmware {
     }
 
     async installGitRelease(div) {
+        const btn = this.gitUpdateButton(div);
+        if (btn?.disabled) return;
         let obj = ui.fromElement(div);
-        const currentMajor = this.getMainVersion(document.getElementById('divGitInstall')?.getAttribute('data-currentver'));
+        if (!obj.version) return;
+        const currentMajor = this.getMainVersion(div?.getAttribute('data-currentver'));
         const targetMajor = this.getMainVersion(obj.version);
 
         // Sécurité absolue contre le contournement HTML
@@ -5840,10 +7861,9 @@ class Firmware {
             ui.errorMessage(tr('MSG_ALERT')).querySelector('.sub-message').innerHTML = tr('ERR_GIT_PARTITION_BLOCKED');
             return;
         }
-        if (!this.isMobile()) {
-            try { await firmware.backup(); }
-            catch (err) { return ui.serviceError(div, err); }
-        }
+        try { await firmware.backup(); }
+        catch (err) { return ui.serviceError(div, err); }
+        const startGit = () => {
         putJSONSync(`/downloadFirmware?ver=${obj.version}`, {}, (err, ver) => {
             if (err) return ui.serviceError(err);
             general.reloadApp = true;
@@ -5869,105 +7889,123 @@ class Firmware {
             const hP = div.querySelector('.instructions-header p');
             if (hP) hP.innerHTML = desc;
 
-            div.querySelector('[close]').onclick = () => closeOverlay(div);
+            firmware.setUpdateBusy(true);
+            div.querySelector('[close]').onclick = (e) => { e.preventDefault(); e.stopPropagation(); };
             div.querySelector('#btnCancelUpdate').onclick = () => firmware.cancelInstallGit(div);
         });
+        };
+        if (get('chkMeshUpdatePeers')?.checked) {
+            putJSONSync('/mesh/pushUpdate', { peer: 'all', ver: obj.version, follow: true }, () => startGit());
+        } else startGit();
     }
     cancelInstallGit(div) {
         putJSONSync(`/cancelFirmware`, {}, (err) => {
+            firmware.setUpdateBusy(false);
             if (err) ui.serviceError(err);
             closeOverlay(div);
         });
     }
     updateGithub() {
+        this.updateManual();
+    }
+    gitReleasesUrl() {
+        return 'https://github.com/jcvsite/ESPSomfy-RTS/releases';
+    }
+    gitUpdateButton(div) {
+        return div?.querySelector('#btnGitUpdate') || div?.querySelector('#btnUpdate');
+    }
+    setGitUpdateEnabled(div, on) {
+        const btn = this.gitUpdateButton(div);
+        if (btn) btn.disabled = !on;
+    }
+    syncLocalUpdateButton(div) {
+        const btn = div?.querySelector('#btnUploadFile');
+        if (btn) btn.disabled = !this._pkgParsed;
+    }
+    fillGithubPanel(div, panel) {
+        this.setGitUpdateEnabled(div, false);
+        panel.innerHTML = `<div class="wifiConnectScan"><div class="lds-roller"><div></div><div></div><div></div><div></div><div></div><div></div><div></div><div></div></div></div>`;
+        const releasesUrl = this.gitReleasesUrl();
+        const linkSvg = '<svg class="svgInTextSmall"><use href="#svg-linkOut"></use></svg>';
         getJSONSync('/getReleases', (err, rel) => {
-            if (err) return ui.serviceError(err);
-            const div = document.createElement('div'), isMob = this.isMobile();
-            const chip = (get('divContainer').getAttribute('data-chipmodel') || "").toLowerCase();
-            div.id = 'divGitInstall';
-            div.className = 'inst-overlay';
-
+            if (err) {
+                this.setGitUpdateEnabled(div, false);
+                panel.innerHTML = `<div class="empty-desc">${tr('ERR_UNSPECIFIED')}</div>`;
+                return ui.serviceError(err);
+            }
+            const chip = (get('divContainer').getAttribute('data-chipmodel') || '').toLowerCase();
+            const installed = rel.appVersion?.name || '';
+            div.setAttribute('data-currentver', installed);
+            if (!Array.isArray(rel.releases)) rel.releases = [];
             rel.releases.sort((a, b) => a.preRelease === b.preRelease && b.draft === a.draft ? 0 : a.preRelease ? 1 : -1);
-
             const optsHtml = rel.releases.map(r => {
                 const name = r.name.toLowerCase();
                 if (name === 'main' || name === 'master' || (r.hwVersions.length > 0 && r.hwVersions.indexOf(chip) < 0)) return '';
                 return `<option value="${r.version.name}" data-prerelease="${r.preRelease}">${r.name}${r.preRelease ? ' - Pre' : ''}</option>`;
             }).join('');
-
-            div.innerHTML = `
-            <div class="instructions-content">
-            <div class="overlay-static-content">
-            ${overlayHeader('UPDATE_GIT_TITLE', 'UPDATE_GIT_DESC', 'svg-github')}
-            <div class="uniRow"><span class="label">${tr('FIRMWARE_INSTALLED')}</span><span class="labelgrey">${rel.appVersion.name}</span></div>
+            if (!optsHtml.trim()) {
+                this.setGitUpdateEnabled(div, false);
+                panel.innerHTML = `
+                <div class="uniRow"><span class="label">${tr('FIRMWARE_INSTALLED')}</span><span class="labelgrey">${installed}</span></div>
+                <a href="${releasesUrl}" target="_blank" class="link">${tr('FIRMWARE_NOTE_GITHUB')}${linkSvg}</a>
+                <div class="empty-desc">${tr('FW_UPDATE_NO_GITHUB') || 'No GitHub update available.'}</div>`;
+                return;
+            }
+            panel.innerHTML = `
+            <div class="uniRow"><span class="label">${tr('FIRMWARE_INSTALLED')}</span><span class="labelgrey">${installed}</span></div>
             <div class="uniRow">
             <span class="label">${tr('FIRMWARE_AVAILABLE')}</span>
             <select id="selVersion" class="selectCompac" data-bind="version">${optsHtml}</select>
             </div>
-            <a id="lnkGithubRelease" href="#" target="_blank" class="link">${tr('FIRMWARE_NOTE_GITHUB')}<svg class="svgInTextSmall"><use href="#svg-linkOut"></use></svg></a>
+            <a id="lnkGithubRelease" href="${releasesUrl}" target="_blank" class="link">${tr('FIRMWARE_NOTE_GITHUB')}${linkSvg}</a>
             <div id="divPrereleaseWarning" class="error" style="display:none;"><svg><use href=#svg-error></use></svg><div><span id="spanUpdateWarning"></span></div></div>
-            <div class="hrDiv"></div>
-            <div class="warningText"><svg><use href="#svg-warning"></use></svg><span>${tr('FIRMWARE_CACHE')}</span></div>
-
             <div id="notesPreview" class="release-notes-preview">
-            <div class="wifiConnectScan">
-            <div class="lds-roller"><div></div><div></div><div></div><div></div><div></div><div></div><div></div><div></div></div>
-            </div>
-            </div>
-            <div class="hrDivFooter"></div>
-            </div> <div class="button-container-overlay">
-            <div class="footer-sticky-content">
-            <div class="uniRow">
-            <div class="uniText"><span class="uniLabel">${tr('FIRMWARE_SAVE_BACKUP')}</span><span class="uniStatus">${tr(isMob ? 'FIRMWARE_SAVE_BACKUP_DESC_MOB' : 'FIRMWARE_SAVE_BACKUP_DESC')}</span></div>
-            <div id="btnBackupCfg" class="gitBackup" onclick="firmware.backup()"><svg><use href="#svg-download"></use></svg></div>
-            </div>
-            <div class="button-container-row">
-            <button id="btnClose" line type="button" onclick="closeOverlay(get('divGitInstall'))">${tr('BT_CANCEL_1')}</button>
-            <button id="btnUpdate" type="button" class="btn-main" onclick="firmware.installGitRelease(get('divGitInstall'))">${tr('BT_UPDATE')}</button>
-            </div>
-            </div>
-            </div>
+            <div class="wifiConnectScan"><div class="lds-roller"><div></div><div></div><div></div><div></div><div></div><div></div><div></div><div></div></div></div>
             </div>`;
-
-            shOverlay(div);
             const sel = div.querySelector('#selVersion');
-
             const updateNotes = async () => {
                 const nDiv = div.querySelector('#notesPreview'), lnk = div.querySelector('#lnkGithubRelease');
-                if (!nDiv) return;
-
+                if (!nDiv || !sel) return;
+                const tag = sel.value;
+                this.setGitUpdateEnabled(div, false);
+                if (!tag) {
+                    if (lnk) lnk.href = releasesUrl;
+                    nDiv.innerHTML = `<div class="empty-desc">${tr('FW_UPDATE_NO_GITHUB') || 'No GitHub update available.'}</div>`;
+                    return;
+                }
+                if (lnk) lnk.href = `${releasesUrl}/tag/${encodeURIComponent(tag)}`;
                 nDiv.innerHTML = '<div class="wifiConnectScan"><div class="lds-roller"><div></div><div></div><div></div><div></div><div></div><div></div><div></div><div></div></div></div>';
-
                 try {
-                    const r = await firmware.getReleaseInfo(sel.value, true);
+                    const r = await firmware.getReleaseInfo(tag, true);
                     if (r?.info?.body) {
                         nDiv.innerHTML = firmware.parseMarkdown(r.info.body);
                         if (lnk && r.info.html_url) lnk.href = r.info.html_url;
-                    } else {
-                        throw new Error("No body");
-                    }
+                        if (this.gitReleaseSelected(div)) this.setGitUpdateEnabled(div, true);
+                    } else throw new Error('No body');
                 } catch (e) {
-                    nDiv.innerHTML = `
-                    <div class="divGitNoteError">
-                    <div class="gitNoteError">${tr('ERR_GIT_NOTE')}</div>
-                    <div class="gitNoteErrorSub">${tr('UPDATE_GIT_NOTE')}</div>
-                    </div>`;
+                    this.setGitUpdateEnabled(div, false);
+                    nDiv.innerHTML = `<div class="divGitNoteError"><div class="gitNoteError">${tr('ERR_GIT_NOTE')}</div><div class="gitNoteErrorSub">${tr('UPDATE_GIT_NOTE')}</div></div>`;
                 }
             };
-            sel.addEventListener('change', () => { this.gitReleaseSelected(div); updateNotes(); });
-            this.gitReleaseSelected(div);
-            updateNotes();
+            if (sel) {
+                sel.addEventListener('change', () => { this.gitReleaseSelected(div); updateNotes(); });
+                this.gitReleaseSelected(div);
+                updateNotes();
+            }
         });
     }
     gitReleaseSelected(div) {
         const sel = div.querySelector('#selVersion');
-        if (!sel || sel.selectedIndex === -1) return;
+        const btnUpdate = this.gitUpdateButton(div);
+        if (!sel || sel.selectedIndex === -1 || !sel.value) {
+            if (btnUpdate) btnUpdate.disabled = true;
+            return false;
+        }
 
         const opt = sel.options[sel.selectedIndex];
         const isPre = opt.getAttribute('data-prerelease') === "true";
         const divPre = div.querySelector('#divPrereleaseWarning');
         const spanWarning = div.querySelector('#spanUpdateWarning');
-        const btnUpdate = div.querySelector('#btnUpdate');
         const currentMajor = this.getMainVersion(div.getAttribute('data-currentver'));
         const targetMajor = this.getMainVersion(sel.value);
 
@@ -5987,15 +8025,14 @@ class Firmware {
             if (spanWarning) spanWarning.innerHTML = blockMessage;
             if (divPre) divPre.style.display = 'flex';
             if (btnUpdate) btnUpdate.disabled = true;
-        } else {
-            if (btnUpdate) btnUpdate.disabled = false;
-            if (divPre) {
-                if (isPre) {
-                    if (spanWarning) spanWarning.innerHTML = tr('UPDATE_GIT_RELEASE_BETA');
-                    divPre.style.display = 'flex';
-                } else {
-                    divPre.style.display = 'none';
-                }
+            return false;
+        }
+        if (divPre) {
+            if (isPre) {
+                if (spanWarning) spanWarning.innerHTML = tr('UPDATE_GIT_RELEASE_BETA');
+                divPre.style.display = 'flex';
+            } else {
+                divPre.style.display = 'none';
             }
         }
         const divNotes = div.querySelector('#divReleaseNotes');
@@ -6003,13 +8040,14 @@ class Firmware {
             const val = sel.value;
             divNotes.style.display = (!val || val === 'main') ? 'none' : '';
         }
+        return true;
     }
     async getReleaseInfo(tag, silent = false) {
         let overlay = null;
         if (!silent) overlay = ui.waitMessage(document.getElementById('divContainer'));
         try {
             let ret = { resp: { ok: false }, info: null };
-            ret.resp = await fetch(`https://api.github.com/repos/xkain/ESPSomfy-RTS/releases/tags/${tag}`);
+            ret.resp = await fetch(`https://api.github.com/repos/jcvsite/ESPSomfy-RTS/releases/tags/${tag}`);
             if (ret.resp.ok) {
                 ret.info = await ret.resp.json();
             }
@@ -6082,26 +8120,552 @@ class Firmware {
         ctx.parse();
         return ctx.html;
     }
-    updateManual(isApp = false) {
-        const service = isApp ? '/updateApplication' : '/updateFirmware';
-        const div = this.createFileUploader(service);
-
-        if (isApp) general.reloadApp = true;
-        const currentVer = isApp ? (general?.appVersion || this.appVersion) : (get('spanFwVersion').innerText || '?.?.?');
+    async updateManual(isApp = false) {
+        void isApp;
+        if (typeof general !== 'undefined' && general.refreshVersions)
+            await general.refreshVersions();
+        const div = this.createFileUploader('/updatePackage');
+        this._pkgParsed = null;
 
         div.querySelector('#divInstText').innerHTML = `
-        ${overlayHeader('MANUAL_UPDATE_TITLE', isApp ? 'UPDATE_LITTLEFS_DESC' : 'UPDATE_FIRMWARE_DESC', 'svg-update')}
-        <div class="uniRow"><span class="uniLabel">${tr('FIRMWARE_INSTALLED')}</span><span class="labelgrey">${currentVer}</span></div>
-        <div class="warningText"><span>${tr('FIRMWARE_CACHE')}</span></div></div>
-        <div class="hrDiv"></div>`;
+        ${overlayHeader('MANUAL_UPDATE_TITLE', 'FW_UPDATE_PKG_DESC', 'svg-update')}
+        <div class="subtab-container overlay-subtabs">
+            <span class="selected" data-updatetab="local">${tr('FW_UPDATE_TAB_LOCAL') || 'Local file'}</span>
+            <span data-updatetab="github">${tr('FW_UPDATE_TAB_GITHUB') || 'GitHub'}</span>
+        </div>`;
 
-        div.className += isApp ? ' mode-app-update' : ' mode-firm-update';
+        div.className += ' mode-pkg-update';
         shOverlay(div);
 
         const btnB = div.querySelector('#btnBackupCfg');
         if (btnB) {
             btnB.style.display = 'flex';
             btnB.onclick = () => firmware.backup();
+        }
+        div._githubLoaded = false;
+        div.querySelectorAll('[data-updatetab]').forEach(tab => {
+            tab.addEventListener('click', () => this.setUpdateTab(div, tab.getAttribute('data-updatetab')));
+        });
+        this.setUpdateTab(div, 'local');
+        this.syncMeshPeerOption();
+    }
+    syncMeshPeerOption() {
+        const lbl = get('lblMeshUpdatePeers');
+        const chk = get('chkMeshUpdatePeers');
+        if (!lbl || !chk) return;
+        const apply = (peers) => {
+            const role = document.documentElement.getAttribute('data-mesh-role');
+            const online = (peers || []).filter(p => p.online).length;
+            const show = role === 'router' && online > 0;
+            lbl.style.display = show ? '' : 'none';
+            if (show && !lbl.dataset.userSet) chk.checked = true;
+            chk.onchange = () => { lbl.dataset.userSet = '1'; };
+        };
+        const cached = (typeof mesh !== 'undefined' && mesh.state && mesh.state.peers) || [];
+        apply(cached);
+        getJSON('/mesh/state', (err, st) => {
+            if (err || !st) return;
+            if (typeof mesh !== 'undefined') mesh.state = st;
+            apply(st.peers || []);
+        });
+    }
+    setUpdateTab(div, tab) {
+        const github = tab === 'github';
+        div.querySelectorAll('[data-updatetab]').forEach(t => t.classList.toggle('selected', t.getAttribute('data-updatetab') === tab));
+        const g = div.querySelector('#divUpdateTabGithub');
+        const l = div.querySelector('#divUpdateTabLocal');
+        if (g) g.style.display = github ? '' : 'none';
+        if (l) l.style.display = github ? 'none' : '';
+        const btnGit = div.querySelector('#btnGitUpdate');
+        const btnUp = div.querySelector('#btnUploadFile');
+        if (btnGit) btnGit.style.display = github ? '' : 'none';
+        if (btnUp) {
+            btnUp.style.display = github ? 'none' : '';
+            if (!github) this.syncLocalUpdateButton(div);
+        }
+        if (github && g && !div._githubLoaded) {
+            div._githubLoaded = true;
+            this.fillGithubPanel(div, g);
+        }
+    }
+    fmtBytes(n) {
+        if (!n && n !== 0) return '—';
+        if (n < 1024) return `${n} B`;
+        if (n < 1048576) return `${(n / 1024).toFixed(1)} KB`;
+        return `${(n / 1048576).toFixed(2)} MB`;
+    }
+    deviceFwVersion() {
+        return (get('spanFwVersion')?.innerText || '').trim() || '—';
+    }
+    deviceAppVersion() {
+        return (get('spanAppVersion')?.innerText || general?.appVersion || '').trim() || '—';
+    }
+    normalizeVersion(ver) {
+        if (!ver) return '';
+        const m = String(ver).trim().match(/v?(\d+(?:\.\d+){0,3})/i);
+        return m ? m[1] : '';
+    }
+    compareVersions(a, b) {
+        const pa = this.normalizeVersion(a).split('.').map(n => parseInt(n, 10) || 0);
+        const pb = this.normalizeVersion(b).split('.').map(n => parseInt(n, 10) || 0);
+        const len = Math.max(pa.length, pb.length, 3);
+        for (let i = 0; i < len; i++) {
+            const x = pa[i] || 0, y = pb[i] || 0;
+            if (x < y) return -1;
+            if (x > y) return 1;
+        }
+        return 0;
+    }
+    isOlderVersion(pkg, device) {
+        if (!this.normalizeVersion(pkg) || !this.normalizeVersion(device)) return false;
+        return this.compareVersions(pkg, device) < 0;
+    }
+    versionFromFilename(name) {
+        if (!name) return '';
+        const m = String(name).match(/(?:^|[^\d])v?(\d+\.\d+\.\d+)(?:[^0-9]|$)/i);
+        return m ? `v${m[1]}` : '';
+    }
+    versionFromHeader(buf) {
+        if (!buf || buf.byteLength < 32) return '';
+        const bytes = new Uint8Array(buf, 20, 12);
+        let s = '';
+        for (let i = 0; i < bytes.length && bytes[i]; i++) s += String.fromCharCode(bytes[i]);
+        s = s.trim();
+        return this.normalizeVersion(s) ? (s.toLowerCase().startsWith('v') ? s : `v${this.normalizeVersion(s)}`) : '';
+    }
+    displayVersion(ver) {
+        return ver || (tr('FW_UPDATE_PKG_VER_UNKNOWN') || 'unknown');
+    }
+    parseEspsomfy(buf) {
+        if (!buf || buf.byteLength < 32) throw new Error('ERR_INVALID_FILE_PACKAGE');
+        const u8 = new Uint8Array(buf, 0, 8);
+        const magic = String.fromCharCode(...u8);
+        if (magic !== 'ESPSOMFY') throw new Error('ERR_INVALID_FILE_PACKAGE');
+        const view = new DataView(buf);
+        const hdrVer = view.getUint16(8, true);
+        if (hdrVer !== 1) throw new Error('ERR_INVALID_FILE_PACKAGE');
+        const chipId = view.getUint8(10);
+        const flags = view.getUint8(11);
+        const fwSize = view.getUint32(12, true);
+        const fsSize = view.getUint32(16, true);
+        const chipNames = {
+            0: 'esp32', 1: 'esp32wrover', 2: 'esp32c3', 3: 'esp32s2',
+            4: 'esp32s3_4mb', 5: 'esp32s3_8mb'
+        };
+        let offset = 32;
+        let fw = null, fs = null;
+        if (flags & 1) {
+            if (offset + fwSize > buf.byteLength) throw new Error('ERR_INVALID_FILE_PACKAGE');
+            fw = buf.slice(offset, offset + fwSize);
+            offset += fwSize;
+        }
+        if (flags & 2) {
+            if (offset + fsSize > buf.byteLength) throw new Error('ERR_INVALID_FILE_PACKAGE');
+            fs = buf.slice(offset, offset + fsSize);
+        }
+        return {
+            chipId,
+            chipName: chipNames[chipId] || `chip${chipId}`,
+            hasFw: !!(flags & 1 && fw && fw.byteLength),
+            hasFs: !!(flags & 2 && fs && fs.byteLength),
+            fwSize: fw ? fw.byteLength : 0,
+            fsSize: fs ? fs.byteLength : 0,
+            version: this.versionFromHeader(buf),
+            fw, fs
+        };
+    }
+    async onUpdatePackageSelected(input) {
+        const file = input.files && input.files[0];
+        const span = get('span-selected-file');
+        const parts = get('divPkgParts');
+        this._pkgParsed = null;
+        if (!file) {
+            if (span) { span.innerText = tr('CHOOSE_FILE'); span.style.opacity = ''; }
+            if (parts) parts.style.display = 'none';
+            this.syncLocalUpdateButton(get('divUploadFile'));
+            return;
+        }
+        if (span) { span.innerText = file.name; span.style.opacity = '1'; }
+        const name = file.name.toLowerCase();
+        try {
+            const buf = await file.arrayBuffer();
+            let parsed;
+            const fileVer = this.versionFromFilename(file.name);
+            if (name.endsWith('.espsomfy') || (buf.byteLength >= 8 && String.fromCharCode(...new Uint8Array(buf, 0, 8)) === 'ESPSOMFY')) {
+                parsed = this.parseEspsomfy(buf);
+                if (!parsed.version) parsed.version = fileVer;
+            } else if (name.includes('.littlefs') && name.endsWith('.bin')) {
+                parsed = {
+                    chipId: -1, chipName: '', hasFw: false, hasFs: true,
+                    fwSize: 0, fsSize: buf.byteLength, fw: null, fs: buf,
+                    version: fileVer
+                };
+            } else if (name.includes('.ino.') && name.endsWith('.bin')) {
+                parsed = {
+                    chipId: -1, chipName: '', hasFw: true, hasFs: false,
+                    fwSize: buf.byteLength, fsSize: 0, fw: buf, fs: null,
+                    version: fileVer
+                };
+            } else {
+                throw new Error('ERR_INVALID_FILE_PACKAGE');
+            }
+            this._pkgParsed = parsed;
+            if (typeof general !== 'undefined' && general.refreshVersions)
+                await general.refreshVersions();
+            this.applyPkgPartUi(parsed);
+            this.syncLocalUpdateButton(get('divUploadFile'));
+        } catch (e) {
+            this._pkgParsed = null;
+            if (parts) parts.style.display = 'none';
+            this.syncLocalUpdateButton(get('divUploadFile'));
+            ui.errorMessage(tr('MSG_ALERT')).querySelector('.sub-message').innerHTML = tr(e.message || 'ERR_INVALID_FILE_PACKAGE');
+            input.value = '';
+            if (span) { span.innerText = tr('CHOOSE_FILE'); span.style.opacity = ''; }
+        }
+    }
+    applyPkgPartUi(parsed) {
+        const parts = get('divPkgParts');
+        if (!parts || !parsed) return;
+        parts.style.display = '';
+        const fwVer = this.deviceFwVersion();
+        const appVer = this.deviceAppVersion();
+        const pkgVer = this.displayVersion(parsed.version);
+        const deviceInfo = get('divPkgDeviceInfo');
+        if (deviceInfo) {
+            deviceInfo.innerHTML = (tr('FW_UPDATE_PKG_DEVICE') || 'Device: firmware %1 · UI %2')
+                .replace('%1', fwVer)
+                .replace('%2', appVer);
+        }
+        const info = get('divPkgInfo');
+        if (info) {
+            info.innerHTML = (tr('FW_UPDATE_PKG_INFO') || 'Package %3 — firmware %1 · application %2')
+                .replace('%1', parsed.hasFw ? this.fmtBytes(parsed.fwSize) : '—')
+                .replace('%2', parsed.hasFs ? this.fmtBytes(parsed.fsSize) : '—')
+                .replace('%3', pkgVer);
+        }
+        const lblFw = get('lblPkgFw');
+        if (lblFw) {
+            lblFw.innerHTML = parsed.hasFw
+                ? (tr('FW_UPDATE_PKG_PART_FW_VER') || 'Firmware — package %1 (device %2)')
+                    .replace('%1', pkgVer)
+                    .replace('%2', fwVer)
+                : (tr('FW_UPDATE_PKG_PART_FW') || 'Firmware');
+        }
+        const lblApp = get('lblPkgApp');
+        if (lblApp) {
+            lblApp.innerHTML = parsed.hasFs
+                ? (tr('FW_UPDATE_PKG_PART_APP_VER') || 'Application — package %1 (device %2)')
+                    .replace('%1', pkgVer)
+                    .replace('%2', appVer)
+                : (tr('FW_UPDATE_PKG_PART_APP') || 'Application (web UI)');
+        }
+        const warn = get('divPkgChipWarn');
+        if (warn) {
+            const deviceChip = (get('divContainer')?.getAttribute('data-chipmodel') || '').toLowerCase();
+            const pkgChip = (parsed.chipName || '').toLowerCase();
+            let soft = false;
+            if (pkgChip && deviceChip) {
+                const simple = (s) => s.replace(/[^a-z0-9]/g, '');
+                const d = simple(deviceChip);
+                const p = simple(pkgChip).replace(/4mb|8mb/g, '');
+                soft = !d.includes(p) && !p.includes(d);
+            }
+            if (soft) {
+                warn.style.display = '';
+                warn.innerHTML = `<span>${tr('FW_UPDATE_PKG_CHIP_WARN').replace('%1', parsed.chipName).replace('%2', deviceChip)}</span>`;
+            } else {
+                warn.style.display = 'none';
+                warn.innerHTML = '';
+            }
+        }
+        const chkFw = get('chkPkgFw');
+        const chkApp = get('chkPkgApp');
+        const chkAll = get('chkPkgSelectAll');
+        const chkCache = get('chkPkgClearCache');
+        if (chkFw) {
+            chkFw.disabled = !parsed.hasFw;
+            chkFw.checked = !!parsed.hasFw;
+        }
+        if (chkApp) {
+            chkApp.disabled = !parsed.hasFs;
+            chkApp.checked = !!parsed.hasFs;
+        }
+        if (chkAll) {
+            chkAll.checked = !!(parsed.hasFw && parsed.hasFs);
+            chkAll.disabled = !(parsed.hasFw || parsed.hasFs);
+        }
+        if (chkCache) chkCache.checked = !!parsed.hasFs;
+        this.onPkgPartChanged();
+    }
+    confirmDowngradeIfNeeded(parsed, wantFw, wantApp) {
+        return new Promise((resolve) => {
+            const pkg = parsed?.version || '';
+            if (!this.normalizeVersion(pkg)) {
+                resolve(true);
+                return;
+            }
+            const curFw = this.deviceFwVersion();
+            const curApp = this.deviceAppVersion();
+            const olderFw = wantFw && this.isOlderVersion(pkg, curFw);
+            const olderApp = wantApp && this.isOlderVersion(pkg, curApp);
+            if (!olderFw && !olderApp) {
+                resolve(true);
+                return;
+            }
+            const deviceShown = olderFw ? curFw : curApp;
+            const prompt = ui.promptMessage(tr('PROMPT_DOWNGRADE_TITLE') || 'Install older version?', () => resolve(true));
+            prompt.querySelector('.sub-message').innerHTML =
+                `<p>${(tr('PROMPT_DOWNGRADE_DESC') || 'The selected package (%1) is older than this device (%2). Continue anyway?')
+                    .replace('%1', this.displayVersion(pkg))
+                    .replace('%2', deviceShown)}</p>`;
+            const btnNo = prompt.querySelector('button[line]');
+            if (btnNo) {
+                btnNo.onclick = () => {
+                    ui.clearErrors();
+                    resolve(false);
+                };
+            }
+        });
+    }
+    onPkgSelectAllChanged(checked) {
+        const chkFw = get('chkPkgFw');
+        const chkApp = get('chkPkgApp');
+        if (chkFw && !chkFw.disabled) chkFw.checked = checked;
+        if (chkApp && !chkApp.disabled) chkApp.checked = checked;
+        this.onPkgPartChanged();
+    }
+    onPkgPartChanged() {
+        const chkFw = get('chkPkgFw');
+        const chkApp = get('chkPkgApp');
+        const chkAll = get('chkPkgSelectAll');
+        const chkCache = get('chkPkgClearCache');
+        if (chkAll && chkFw && chkApp) {
+            const available = [];
+            if (!chkFw.disabled) available.push(chkFw.checked);
+            if (!chkApp.disabled) available.push(chkApp.checked);
+            chkAll.checked = available.length > 0 && available.every(Boolean);
+        }
+        if (chkCache && chkApp && chkApp.checked) chkCache.checked = true;
+    }
+    postUpdateBlob(service, blob, filename, { reboot = true, onProgress = null } = {}) {
+        return new Promise((resolve, reject) => {
+            const formData = new FormData();
+            formData.append('file', blob, filename);
+            let url = baseUrl ? `${baseUrl}${service}` : service;
+            if (!reboot) url += (url.includes('?') ? '&' : '?') + 'reboot=0';
+            if (blob && blob.size && service.indexOf('/mesh/pushUpdate') === 0)
+                url += (url.includes('?') ? '&' : '?') + 'size=' + blob.size;
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', url, true);
+            xhr.timeout = 10 * 60 * 1000; // large FS/FW on slow Wi‑Fi
+            xhr.upload.onprogress = (evt) => {
+                if (onProgress && evt.total) onProgress(Math.min(0.97, evt.loaded / evt.total));
+            };
+            xhr.upload.onload = () => {
+                // Bytes sent; device remounts FS then replies (shade restore runs after the reply).
+                if (onProgress) onProgress(0.99);
+                const prog = get('progFileUpload') || get('progApplicationDownload');
+                if (prog) prog.setAttribute('data-progress', tr('FW_UPDATE_FINALIZING') || 'Finalizing…');
+            };
+            xhr.onload = () => {
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    try {
+                        const j = JSON.parse(xhr.responseText || '{}');
+                        if (j.status && j.status !== 'SUCCESS') {
+                            reject(new Error(j.desc || 'ERR_UPDATE_UPLOAD_FAILED'));
+                            return;
+                        }
+                    } catch (_) { /* non-JSON success still ok */ }
+                    if (onProgress) onProgress(1);
+                    resolve();
+                } else {
+                    reject(new Error(tr('ERR_UPDATE_UPLOAD_FAILED').replace('%1', String(xhr.status))));
+                }
+            };
+            xhr.onerror = () => reject(new Error('Upload Failed'));
+            xhr.ontimeout = () => reject(new Error('Upload timed out'));
+            xhr.onabort = () => reject(new Error('Upload cancelled'));
+            xhr.send(formData);
+            this._pkgXhr = xhr;
+        });
+    }
+    _sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+    async waitDeviceReady(timeoutMs = 30000) {
+        const origin = baseUrl || '';
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            try {
+                const res = await fetch(`${origin}/controller?_=${Date.now()}`, {
+                    method: 'GET',
+                    cache: 'no-store',
+                    credentials: 'same-origin'
+                });
+                if (res.ok) return true;
+            } catch (_) { /* device settling */ }
+            await this._sleep(750);
+        }
+        return false;
+    }
+    meshPeerUpdateJobs(parsed, wantFw, wantApp) {
+        return new Promise((resolve) => {
+            getJSON('/mesh/state', (err, st) => {
+                const peers = (!err && st && st.peers) ? st.peers.filter(p => p.online && p.id) : [];
+                const jobs = [];
+                peers.forEach(p => {
+                    if (wantFw && parsed.fw) {
+                        jobs.push({
+                            service: `/mesh/pushUpdate?peer=${encodeURIComponent(p.id)}&part=fw`,
+                            blob: new Blob([parsed.fw], { type: 'application/octet-stream' }),
+                            filename: 'SomfyController.ino.esp32.bin',
+                            reboot: false,
+                            peerId: p.id
+                        });
+                    }
+                    if (wantApp && parsed.fs) {
+                        jobs.push({
+                            service: `/mesh/pushUpdate?peer=${encodeURIComponent(p.id)}&part=fs`,
+                            blob: new Blob([parsed.fs], { type: 'application/octet-stream' }),
+                            filename: 'SomfyController.littlefs.bin',
+                            reboot: false,
+                            peerId: p.id,
+                            waitReboot: true
+                        });
+                    }
+                });
+                resolve(jobs);
+            });
+        });
+    }
+    waitMeshPeer(peerId, timeoutMs = 60000) {
+        return new Promise(async (resolve) => {
+            const deadline = Date.now() + timeoutMs;
+            let sawDown = false;
+            while (Date.now() < deadline) {
+                const st = await new Promise(res => getJSON('/mesh/state', (e, s) => res(!e && s ? s : null)));
+                const p = st && (st.peers || []).find(x => x.id === peerId);
+                const on = !!(p && p.online);
+                if (!on) sawDown = true;
+                else if (sawDown) { resolve(true); return; }
+                await this._sleep(1500);
+            }
+            resolve(false);
+        });
+    }
+    async uploadUpdatePackage(el) {
+        const title = tr('MSG_ALERT');
+        const parsed = this._pkgParsed;
+        const field = el.querySelector('input[type="file"]');
+        if (!field?.files?.[0] || !parsed) {
+            ui.errorMessage(title).querySelector('.sub-message').innerHTML = tr('ERR_NO_FILE_FIRMWARE_SELECTED');
+            return;
+        }
+        const wantFw = !!(get('chkPkgFw')?.checked && parsed.hasFw);
+        const wantApp = !!(get('chkPkgApp')?.checked && parsed.hasFs);
+        const clearCache = !!get('chkPkgClearCache')?.checked;
+        if (!wantFw && !wantApp) {
+            ui.errorMessage(title).querySelector('.sub-message').innerHTML = tr('ERR_NO_UPDATE_PART_SELECTED');
+            return;
+        }
+        if ((wantFw && !parsed.fw) || (wantApp && !parsed.fs)) {
+            ui.errorMessage(title).querySelector('.sub-message').innerHTML = tr('ERR_UPDATE_PART_MISSING');
+            return;
+        }
+
+        if (!(await this.confirmDowngradeIfNeeded(parsed, wantFw, wantApp))) return;
+
+        try { await firmware.backup(); }
+        catch (e) { return ui.serviceError(el, e); }
+
+        ['btnBackupCfg', 'btnUploadFile'].forEach(id => {
+            const b = el.querySelector('#' + id);
+            if (b) b.style.display = 'none';
+        });
+        field.disabled = true;
+        const steps = el.querySelector('.vertical-steps-container');
+        if (steps) steps.style.display = 'none';
+        const partsUi = get('divPkgParts');
+        if (partsUi) partsUi.style.display = 'none';
+        const prog = el.querySelector('#progFileUpload');
+        const btnCancel = el.querySelector('#btnClose');
+        prog.style.display = '';
+
+        const jobs = [];
+        if (wantFw) {
+            jobs.push({
+                service: '/updateFirmware',
+                blob: new Blob([parsed.fw], { type: 'application/octet-stream' }),
+                filename: 'SomfyController.ino.esp32.bin'
+            });
+        }
+        if (wantApp) {
+            jobs.push({
+                service: '/updateApplication',
+                blob: new Blob([parsed.fs], { type: 'application/octet-stream' }),
+                filename: 'SomfyController.littlefs.bin'
+            });
+        }
+
+        if (clearCache || wantApp) general.reloadApp = true;
+
+        this.setUpdateBusy(true);
+        btnCancel.onclick = () => {
+            if (this._pkgXhr) try { this._pkgXhr.abort(); } catch (_) {}
+            this.setUpdateBusy(false);
+            closeOverlay(el);
+        };
+
+        const setPct = (pct) => {
+            const n = Math.max(0, Math.min(100, Math.round(pct)));
+            prog.style.setProperty('--progress', `${n}%`);
+            prog.setAttribute('data-progress', `${n}%`);
+        };
+
+        try {
+            let peerJobs = [];
+            if (get('chkMeshUpdatePeers')?.checked) {
+                peerJobs = await this.meshPeerUpdateJobs(parsed, wantFw, wantApp);
+            }
+            const allJobs = peerJobs.concat(jobs);
+            for (let i = 0; i < allJobs.length; i++) {
+                const job = allJobs[i];
+                const isLast = i === allJobs.length - 1;
+                const base = i / allJobs.length;
+                const span = 1 / allJobs.length;
+                let lastErr = null;
+                for (let attempt = 1; attempt <= 3; attempt++) {
+                    try {
+                        if (i > 0 || attempt > 1) {
+                            setPct((base) * 100);
+                            await this._sleep(attempt === 1 ? 2000 : 3000 * attempt);
+                            if (!job.peerId) await this.waitDeviceReady(25000);
+                        }
+                        await this.postUpdateBlob(job.service, job.blob, job.filename, {
+                            reboot: job.reboot != null ? job.reboot : isLast,
+                            onProgress: (p) => setPct((base + span * p) * 100)
+                        });
+                        lastErr = null;
+                        break;
+                    } catch (e) {
+                        lastErr = e;
+                        if (attempt >= 3) throw e;
+                    }
+                }
+                if (lastErr) throw lastErr;
+                if (job.peerId && job.waitReboot) await this.waitMeshPeer(job.peerId, 90000);
+            }
+            setPct(100);
+            btnCancel.innerText = tr('BT_CLOSE');
+            if (clearCache) general.reloadApp = true;
+            this.setUpdateBusy(false);
+            general.showRebootWait();
+            closeOverlay(el);
+        } catch (e) {
+            this.setUpdateBusy(false);
+            ui.errorMessage(title).querySelector('.sub-message').innerHTML =
+                tr('ERR_UPDATE_UPLOAD_FAILED').replace('%1', e.message || e);
+            btnCancel.innerText = tr('BT_CLOSE');
         }
     }
     async uploadFile(service, el, data) {
@@ -6115,18 +8679,18 @@ class Firmware {
         else if (service === '/updateApplication' && (!filename.includes('.littlefs') || !filename.endsWith('.bin'))) err = 'ERR_INVALID_FILE_LITTLEFS';
         else if (service === '/updateFirmware' && (!filename.includes('.ino.') || !filename.endsWith('.bin'))) err = 'ERR_INVALID_FILE_FIRMWARE';
         else if (service === '/restore') {
-            if (file.size > 20480) {
+            if (file.size > 65536) {
                 ui.errorMessage(title).querySelector('.sub-message').innerHTML = tr('ERR_BACKUP_TOO_LARGE').replace('%s', file.size.fmt("#,##0"));
                 return;
             }
             if (!filename.endsWith('.backup')) err = 'ERR_INVALID_FILE_BACKUP';
-            else if (!['shades', 'settings', 'network', 'transceiver', 'repeaters', 'mqtt'].some(k => data[k])) err = 'ERR_NO_RESTORE_OPTION';
+            else if (!['shades', 'fixedCodes', 'automation', 'settings', 'network', 'transceiver', 'repeaters', 'mqtt'].some(k => data[k])) err = 'ERR_NO_RESTORE_OPTION';
         }
         if (err) {
             ui.errorMessage(title).querySelector('.sub-message').innerHTML = tr(err);
             return;
         }
-        if (service !== '/restore' && !this.isMobile()) {
+        if (service !== '/restore') {
             try { await firmware.backup(); }
             catch (e) { return ui.serviceError(el, e); }
         }
@@ -6142,6 +8706,9 @@ class Firmware {
         btnCancel = el.querySelector('#btnClose');
         prog.style.display = '';
 
+        const isFwUpdate = service === '/updateFirmware' || service === '/updateApplication';
+        if (isFwUpdate) this.setUpdateBusy(true);
+
         let xhr = new XMLHttpRequest();
         xhr.open('POST', baseUrl ? `${baseUrl}${service}` : service, true);
 
@@ -6156,11 +8723,600 @@ class Firmware {
             if (service === '/restore') {
                 await somfy.init();
                 closeOverlay(get('divUploadFile'));
+            } else if (isFwUpdate) {
+                general.reloadApp = true;
+                this.setUpdateBusy(false);
+                general.showRebootWait();
+                closeOverlay(el);
             }
         };
-        xhr.onerror = () => ui.serviceError(el, 'Upload Failed');
-        btnCancel.onclick = () => { xhr.abort(); closeOverlay(el); };
+        xhr.onerror = () => {
+            if (isFwUpdate) this.setUpdateBusy(false);
+            ui.serviceError(el, 'Upload Failed');
+        };
+        xhr.onabort = () => {
+            if (isFwUpdate) this.setUpdateBusy(false);
+        };
+        btnCancel.onclick = () => {
+            xhr.abort();
+            if (isFwUpdate) this.setUpdateBusy(false);
+            closeOverlay(el);
+        };
         xhr.send(formData);
     }
 }
 var firmware = new Firmware();
+
+function meshIp(n) {
+    if (n == null) return '--';
+    if (typeof n === 'string' && n.indexOf('.') >= 0) return n;
+    n = n >>> 0;
+    return [n & 255, (n >> 8) & 255, (n >> 16) & 255, (n >> 24) & 255].join('.');
+}
+class MeshUi {
+    state = { role: 0, txMode: 0, peers: [], heard: [], ranks: [], assigned: '', routerIp: 0, routerId: '', routerOnline: false };
+    timer = null;
+    _slaveHb = {};
+    init() {
+        const role = document.documentElement.getAttribute('data-mesh-role');
+        const connected = document.documentElement.getAttribute('data-mesh-connected') === '1';
+        if (role === 'unset' && connected) this.showWizard();
+        else this.loadState();
+        if (role === 'repeater') {
+            const p = document.querySelector('.tab-container > span[data-grpid="divMeshSettings"]');
+            if (p && typeof ui !== 'undefined') {
+                ui.setConfigPanel();
+                p.click();
+                const t = document.querySelector('.subtab-container > span[data-grpid="divMeshActivity"]');
+                if (t) t.click();
+            }
+        }
+        if (this.timer) clearInterval(this.timer);
+        this.timer = setInterval(() => this.loadState(), 3000);
+        this.refreshActivityChrome();
+    }
+    onLoggedIn() {
+        const role = document.documentElement.getAttribute('data-mesh-role');
+        const connected = document.documentElement.getAttribute('data-mesh-connected') === '1';
+        if (role === 'unset' && connected) this.showWizard();
+    }
+    showWizard() {
+        const el = get('divMeshWizard');
+        if (el) el.style.display = 'flex';
+        get('divMeshWizRole').style.display = '';
+        get('divMeshWizPair').style.display = 'none';
+    }
+    wizardBack() {
+        get('divMeshWizRole').style.display = '';
+        get('divMeshWizPair').style.display = 'none';
+    }
+    chooseRole(role) {
+        if (role === 1) {
+            putJSONSync('/mesh/role', { role: 1 }, (err, st) => {
+                if (err) return ui.serviceError(err);
+                if (!st || Number(st.role) !== 1) {
+                    return ui.serviceError({ desc: 'Router role did not save. Try again.' });
+                }
+                document.documentElement.setAttribute('data-mesh-role', 'router');
+                get('divMeshWizard').style.display = 'none';
+                general.showRebootWait();
+                putJSONSync('/reboot', {}, () => {});
+            });
+            return;
+        }
+        get('divMeshWizRole').style.display = 'none';
+        get('divMeshWizPair').style.display = '';
+        this.refreshHeard();
+        if (this._heardTimer) clearInterval(this._heardTimer);
+        this._heardTimer = setInterval(() => this.refreshHeard(), 2000);
+    }
+    refreshHeard() {
+        getJSON('/mesh/state', (err, st) => {
+            if (err || !st) return;
+            const box = get('divMeshHeardList');
+            const routers = (st.heard || []).filter(h => h.role === 1);
+            if (!routers.length) {
+                box.innerHTML = `<div class="empty-desc">${tr('MESH_NO_ROUTERS') || 'No Routers heard yet. Wait a few seconds, or type the IP.'}</div>`;
+                return;
+            }
+            box.innerHTML = routers.map(h => `<div class="mesh-heard-item" data-ip="${meshIp(h.ip)}" data-id="${h.id}" onclick="mesh.pickHeard(this)"><b>${h.hostname || h.id}</b> · ${meshIp(h.ip)} · ${h.fw || ''}${h.auth ? ' · login' : ''}</div>`).join('');
+        });
+    }
+    pickHeard(el) {
+        get('fldMeshWizIp').value = el.getAttribute('data-ip') || '';
+        this._routerId = el.getAttribute('data-id') || '';
+    }
+    pairFromWizard() {
+        const ip = (get('fldMeshWizIp').value || '').trim();
+        const user = (get('fldMeshWizUser').value || '').trim();
+        const pass = get('fldMeshWizPass').value || '';
+        const errEl = get('divMeshWizErr');
+        errEl.textContent = '';
+        if (!ip) { errEl.textContent = tr('MESH_NEED_IP') || 'Enter the Router IP.'; return; }
+        if (!pass) { errEl.textContent = tr('MESH_NEED_PASS') || 'Enter the Router login password (set one on the Router first).'; return; }
+        putJSONSync('/mesh/role', { role: 2, routerIp: ip, routerId: this._routerId || '', user, pass }, (err) => {
+            if (err) { errEl.textContent = tr('MESH_PAIR_FAIL') || 'Pair failed. Check IP and password.'; return; }
+            document.documentElement.setAttribute('data-mesh-role', 'repeater');
+            get('divMeshWizard').style.display = 'none';
+            if (this._heardTimer) clearInterval(this._heardTimer);
+            general.showRebootWait();
+            putJSONSync('/reboot', {}, () => {});
+        });
+    }
+    loadState() {
+        getJSON('/mesh/state', (err, st) => {
+            if (err || !st) return;
+            this.state = st;
+            this.render();
+            if (st.otaFollow || (st.peers || []).some(p => p.phase === 'flashing' || p.phase === 'rebooting')) this.watchOta();
+        });
+    }
+    render() {
+        const st = this.state;
+        const peers = st.peers || [];
+        this.renderSlaves(peers);
+        if (typeof somfy !== 'undefined' && somfy.refreshMeshGlance) somfy.refreshMeshGlance();
+        this.renderSummary(st);
+        const list = get('divMeshPeerList');
+        const empty = get('divMeshPeerEmpty');
+        if (list) {
+            if (!list.querySelector('.mesh-peer-name:focus')) {
+                const esc = s => String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+                list.innerHTML = peers.map((p, i) => {
+                    const sh = (p.shades || []).join(', ');
+                    const slot = p.slot || (i + 1);
+                    const host = String(p.hostname || '').replace(/"/g, '&quot;');
+                    const routerFw = (get('spanFwVersion')?.innerText || '').trim();
+                    const behind = p.fw && routerFw && p.fw !== routerFw;
+                    const phase = p.phase || 'idle';
+                    const phaseLbl = {
+                        queued: tr('MESH_OTA_QUEUED') || 'Queued',
+                        flashing: tr('MESH_OTA_FLASHING') || 'Flashing',
+                        rebooting: tr('MESH_OTA_REBOOTING') || 'Rebooting',
+                        done: tr('MESH_OTA_DONE') || 'Up to date',
+                        failed: tr('MESH_OTA_FAILED') || 'Update failed'
+                    }[phase];
+                    const online = !!p.online;
+                    const statusLbl = online ? (tr('MESH_ONLINE') || 'Online') : (tr('MESH_OFFLINE') || 'Offline');
+                    const fwLbl = behind
+                        ? `${tr('MESH_FW_BEHIND') || 'Needs update'} · ${esc(p.fw || '')} → ${esc(routerFw)}`
+                        : `${esc(p.fw || '—')} · ${tr('MESH_FW_CURRENT') || 'Up to date'}`;
+                    const otaBusy = phaseLbl && phase !== 'idle' && phase !== 'done';
+                    const otaFail = phase === 'failed';
+                    const otaHtml = (otaBusy || otaFail)
+                        ? `<div class="mesh-peer-ota${otaFail ? ' is-fail' : ''}">${esc(phaseLbl)}${p.otaError ? ' · ' + esc(p.otaError) : ''}</div>`
+                        : '';
+                    const heard = (p.lastAddr && typeof p.rssi === 'number' && p.rssi > -127)
+                        ? `${tr('MESH_LAST_HEARD') || 'Last heard'} ${esc(p.lastAddr)} · ${p.rssi} dBm`
+                        : '';
+                    const details = [
+                        p.mac ? `MAC ${esc(p.mac)}` : '',
+                        `heap ${p.heap || 0}`,
+                        sh ? `shades ${esc(sh)}` : '',
+                        heard
+                    ].filter(Boolean).join(' · ');
+                    return `<article class="mesh-peer-card${online ? ' is-online' : ' is-offline'}${behind ? ' is-behind' : ''}">
+                        <div class="mesh-peer-top">
+                            <span class="mesh-peer-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><use href="#svg-repeater"></use></svg></span>
+                            <div class="mesh-peer-main">
+                                <div class="mesh-peer-title">
+                                    <span class="mesh-peer-slot">${esc((tr('MESH_RANK_SLAVE') || 'Slave %1').replace('%1', slot))}</span>
+                                    <span class="mesh-badge ${online ? 'is-online' : 'is-offline'}">${esc(statusLbl)}</span>
+                                </div>
+                                <input id="fldMeshPeer${slot}" class="inputAndSelect mesh-peer-name" maxlength="32" data-id="${p.id}" value="${host}" placeholder="${esc(tr('GENERAL_HOSTNAME') || 'Hostname')}" onchange="mesh.renamePeer(this)">
+                                <div class="mesh-peer-ip">${esc(meshIp(p.ip))}</div>
+                            </div>
+                        </div>
+                        <div class="mesh-peer-fw${behind ? ' is-behind' : ''}">${fwLbl}</div>
+                        ${otaHtml}
+                        ${details ? `<div class="mesh-peer-details">${details}</div>` : ''}
+                        <div class="mesh-peer-actions button-container-row">
+                            <button type="button" ${online && behind ? '' : 'line '}onclick="mesh.pushUpdate('${p.id}')">${tr('MESH_UPDATE') || 'Update'}</button>
+                            <button type="button" line onclick="mesh.unpair('${p.id}')">${tr('MESH_UNPAIR') || 'Unpair'}</button>
+                        </div>
+                    </article>`;
+                }).join('');
+            }
+            if (empty) empty.style.display = peers.length ? 'none' : '';
+        }
+        this.renderRoomRadios(st);
+        this.renderRanks(st);
+        const ipFld = get('fldMeshRouterIp');
+        if (ipFld && document.activeElement !== ipFld && st.routerIp) ipFld.value = meshIp(st.routerIp);
+        const host = get('spanMeshRouterHost');
+        if (host) {
+            get('spanMeshRouterHost').textContent = st.routerHost || '--';
+            get('spanMeshRouterIp').textContent = meshIp(st.routerIp);
+            get('spanMeshRouterOnline').textContent = st.routerOnline ? (tr('MESH_ONLINE') || 'Online') : (tr('MESH_OFFLINE') || 'Offline');
+            get('spanMeshRouterId').textContent = st.routerId || '--';
+        }
+    }
+    renderSummary(st) {
+        const box = get('divMeshSummary');
+        if (!box) return;
+        const peers = st.peers || [];
+        const online = peers.filter(p => p.online).length;
+        const roomIds = new Set();
+        if (typeof _rooms !== 'undefined' && Array.isArray(_rooms)) {
+            _rooms.forEach(r => { if (r && Number(r.roomId) > 0) roomIds.add(Number(r.roomId)); });
+        }
+        (st.rooms || []).forEach(r => { if (r && Number(r.roomId) > 0) roomIds.add(Number(r.roomId)); });
+        const rooms = roomIds.size;
+        const ranks = (st.ranks || []).length;
+        const behind = peers.filter(p => {
+            const routerFw = (get('spanFwVersion')?.innerText || '').trim();
+            return p.fw && routerFw && p.fw !== routerFw;
+        }).length;
+        const chip = (icon, label, value, tone) =>
+            `<div class="mesh-summary-chip${tone ? ' is-' + tone : ''}"><span class="mesh-summary-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><use href="#${icon}"></use></svg></span><div><strong>${value}</strong><span>${label}</span></div></div>`;
+        const peerLbl = tr('MESH_SUMMARY_PEERS') || 'Online';
+        const roomLbl = tr('MESH_SUMMARY_ROOMS') || 'Rooms';
+        const rankLbl = tr('MESH_SUMMARY_RANKS') || 'Ranks';
+        const updLbl = tr('MESH_SUMMARY_UPDATES') || 'Updates';
+        box.innerHTML = [
+            chip('svg-repeater', peerLbl, `${online}/${peers.length || 0}`, online ? 'ok' : (peers.length ? 'warn' : '')),
+            chip('svg-emptyRoom', roomLbl, String(rooms), ''),
+            chip('svg-tabRadio', rankLbl, String(ranks), ''),
+            behind ? chip('svg-update', updLbl, String(behind), 'warn') : ''
+        ].filter(Boolean).join('');
+        const peerCount = get('spanMeshPeerCount');
+        if (peerCount) peerCount.textContent = peers.length ? String(peers.length) : '';
+        const roomCount = get('spanMeshRoomCount');
+        if (roomCount) roomCount.textContent = rooms ? String(rooms) : '';
+        const rankCount = get('spanMeshRankCount');
+        if (rankCount) rankCount.textContent = ranks ? String(ranks) : '';
+    }
+    surveyRoomName(s) {
+        const rid = Number(s.roomId);
+        if (rid) {
+            const lists = [];
+            if (typeof _rooms !== 'undefined' && _rooms) lists.push(_rooms);
+            if (typeof somfy !== 'undefined' && Array.isArray(somfy.rooms)) lists.push(somfy.rooms);
+            for (const list of lists) {
+                const r = list.find(x => Number(x.roomId) === rid);
+                if (r && r.name) return String(r.name);
+            }
+        }
+        const el = document.querySelector(`.somfyShade[data-shadeid="${s.shadeId}"] .cfg-room`);
+        return el ? el.textContent.trim() : '';
+    }
+    shadeLabel(shadeId) {
+        const s = (typeof somfy !== 'undefined' && Array.isArray(somfy.shades))
+            ? somfy.shades.find(x => Number(x.shadeId) === Number(shadeId)) : null;
+        if (!s) return `#${shadeId}`;
+        const room = this.surveyRoomName(s);
+        const name = String(s.name || shadeId);
+        return room ? `${room} — ${name}` : name;
+    }
+    radioLabel(idx, peers) {
+        if (idx === 0) return tr('MESH_RANK_THIS') || 'This unit';
+        const p = (peers || []).find(x => Number(x.slot) === idx) || (peers || [])[idx - 1];
+        const slot = (p && p.slot) || idx;
+        const host = p ? (p.hostname || p.id || '') : '';
+        const slave = (tr('MESH_RANK_SLAVE') || 'Slave %1').replace('%1', slot);
+        return host ? `${slave} · ${host}` : slave;
+    }
+    renderRoomRadios(st) {
+        const rl = get('divMeshRoomRadios');
+        if (!rl) return;
+        if (rl.querySelector('select:focus')) return;
+        const peers = st.peers || [];
+        const assigned = {};
+        const picks = {};
+        (st.rooms || []).forEach(r => {
+            assigned[Number(r.roomId)] = (r.radio == null ? 255 : Number(r.radio));
+            picks[Number(r.roomId)] = Number(r.pick) || 0;
+        });
+        const rooms = [];
+        if (typeof _rooms !== 'undefined' && Array.isArray(_rooms)) {
+            _rooms.forEach(r => { if (r && Number(r.roomId) > 0) rooms.push(r); });
+        }
+        (st.rooms || []).forEach(r => {
+            if (!r || !Number(r.roomId)) return;
+            if (!rooms.some(x => Number(x.roomId) === Number(r.roomId))) rooms.push(r);
+        });
+        if (!rooms.length) {
+            rl.innerHTML = `<div class="empty-desc">${tr('MESH_NO_ROOMS') || 'Add rooms on the Somfy tab, then assign a radio here.'}</div>`;
+            return;
+        }
+        const radios = [
+            { idx: 255, label: tr('MESH_RADIO_AUTO') || 'Auto (best radio)' },
+            { idx: 0, label: tr('MESH_RANK_THIS') || 'This unit' }
+        ].concat(peers.map((p, i) => {
+            const idx = Number(p.slot) || (i + 1);
+            return { idx, label: this.radioLabel(idx, peers) };
+        }));
+        const esc = s => String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+        const usingLbl = tr('MESH_RANK_USING') || 'using';
+        rl.innerHTML = rooms.map(r => {
+            const rid = Number(r.roomId);
+            const sel = assigned[rid] != null ? assigned[rid] : 255;
+            const opts = radios.map(x =>
+                `<option value="${x.idx}"${Number(x.idx) === Number(sel) ? ' selected' : ''}>${esc(x.label)}</option>`
+            ).join('');
+            const pick = picks[rid];
+            const using = (sel === 255 || (sel > 0 && pick !== sel))
+                ? `<div class="mesh-room-using">${esc(usingLbl)} · ${esc(this.radioLabel(pick, peers))}</div>`
+                : '';
+            const mode = sel === 255 ? 'auto' : (sel === 0 ? 'router' : 'slave');
+            return `<div class="mesh-room-row" data-mode="${mode}">
+                <span class="mesh-room-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><use href="#svg-emptyRoom"></use></svg></span>
+                <div class="mesh-room-copy">
+                    <div class="mesh-room-name">${esc(r.name || ('Room ' + rid))}</div>
+                    ${using}
+                </div>
+                <div class="mesh-room-controls">
+                    <select class="inputAndSelect" aria-label="${esc(r.name || ('Room ' + rid))}" onchange="mesh.setRoomRadio(${rid}, this.value)">${opts}</select>
+                </div>
+            </div>`;
+        }).join('');
+    }
+    setRoomRadio(roomId, radio) {
+        putJSON('/mesh/roomRadio', { roomId: Number(roomId), radio: Number(radio) }, (err, st) => {
+            if (err) return ui.serviceError(err);
+            if (st) { this.state = st; this.render(); }
+        });
+    }
+    rssiTone(v, minRssi) {
+        if (typeof v !== 'number' || v <= -127) return '';
+        if (v >= -70) return 'good';
+        if (v >= minRssi) return 'mid';
+        return 'poor';
+    }
+    renderRanks(st) {
+        const rl = get('divMeshRankList');
+        if (!rl) return;
+        const openIds = new Set(
+            Array.from(rl.querySelectorAll('details.mesh-rank-card[open]'))
+                .map(el => el.getAttribute('data-shadeid'))
+                .filter(Boolean)
+        );
+        const ranks = st.ranks || [];
+        const peers = st.peers || [];
+        const radios = [0].concat(peers.map((p, i) => Number(p.slot) || (i + 1)));
+        if (!ranks.length) {
+            rl.innerHTML = `<div class="empty-desc">${tr('MESH_NO_RANKS') || 'No ranks yet. Press a linked remote.'}</div>`;
+            return;
+        }
+        const none = tr('MESH_RANK_NONE') || 'no signal';
+        const bestLbl = tr('MESH_RANK_BEST') || 'best';
+        const minRssi = typeof st.minRssi === 'number' ? st.minRssi : -85;
+        const weakLbl = tr('MESH_RANK_WEAK') || 'too weak';
+        const moreLbl = tr('MESH_RANK_DETAILS') || 'All radios';
+        rl.innerHTML = ranks.map(r => {
+            const rssi = r.rssi || [];
+            const pick = Number(r.pick) || 0;
+            const want = r.want != null ? Number(r.want) : pick;
+            const pickV = rssi[pick];
+            const pickHeard = typeof pickV === 'number' && pickV > -127;
+            const bestText = `${this.radioLabel(pick, peers)}${pickHeard ? ` · ${pickV} dBm` : ''}`;
+            const open = openIds.has(String(r.shadeId)) ? ' open' : '';
+            const rows = radios.map(idx => {
+                const v = rssi[idx];
+                const heard = typeof v === 'number' && v > -127;
+                const useful = typeof v === 'number' && v >= minRssi;
+                const best = idx === pick && (idx === 0 || useful);
+                const dead = useful && idx === want && want !== pick;
+                let mark = '';
+                if (dead) mark = tr('MESH_RANK_OFFLINE') || 'offline';
+                else if (best && idx === 0 && !useful) mark = tr('MESH_RANK_DEFAULT') || 'default';
+                else if (best) mark = bestLbl;
+                else if (heard && !useful) mark = weakLbl;
+                const tone = this.rssiTone(v, minRssi);
+                return `<div class="mesh-rank-radio${best ? ' is-best' : ''}${dead ? ' is-offline' : ''}">
+                    <span class="mesh-rank-radio-name">${this.radioLabel(idx, peers)}</span>
+                    <span class="mesh-rank-radio-rssi${tone ? ' mesh-rssi-' + tone : ''}">${heard ? (v + ' dBm') : none}</span>
+                    ${mark ? `<span class="mesh-rank-radio-mark">${mark}</span>` : ''}
+                </div>`;
+            }).join('');
+            return `<details class="mesh-rank-card"${open} data-shadeid="${r.shadeId}">
+                <summary class="mesh-rank-summary">
+                    <span class="mesh-rank-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><use href="#svg-simpleShutter"></use></svg></span>
+                    <span class="mesh-rank-name">${this.shadeLabel(r.shadeId)}</span>
+                    <span class="mesh-rank-best">${bestText}</span>
+                    <svg class="mesh-panel-chevron" viewBox="0 0 24 24" aria-hidden="true"><use href="#svg-arrowDown"></use></svg>
+                </summary>
+                <div class="mesh-rank-body">
+                    <div class="mesh-rank-body-label">${moreLbl}</div>
+                    ${rows}
+                </div>
+            </details>`;
+        }).join('');
+    }
+    renderSlaves(peers) {
+        const box = get('divMeshSlaves');
+        if (!box) return;
+        const role = document.documentElement.getAttribute('data-mesh-role');
+        const esc = s => String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+        const tipLines = (...rows) => rows.filter(Boolean).join('\n');
+        const icon = (on, blink, tip) =>
+            `<span class="mesh-slave-wrap"><span class="mesh-slave${on ? ' online' : ''}${blink ? ' mesh-slave-blink' : ''}" aria-label="${esc(tip.split('\n')[0] || 'Mesh')}"><svg viewBox="0 0 24 24"><use href="#svg-repeater"></use></svg></span><span class="status-tip">${esc(tip)}</span></span>`;
+        if (role === 'repeater') {
+            const st = this.state || {};
+            const on = !!st.routerOnline;
+            const prev = this._slaveHb || {};
+            const blink = on && st.routerHb && st.routerHb !== prev.router;
+            const tip = tipLines(
+                tr('MESH_ROUTER') || 'Router',
+                st.routerHost || st.routerId || '',
+                st.routerIp ? meshIp(st.routerIp) : '',
+                on ? (tr('MESH_ONLINE') || 'Online') : (tr('MESH_OFFLINE') || 'Offline')
+            );
+            box.classList.add('has-peers');
+            box.innerHTML = icon(on, blink, tip);
+            this._slaveHb = { router: st.routerHb };
+            return;
+        }
+        if (role !== 'router' || !peers.length) {
+            box.classList.remove('has-peers');
+            box.innerHTML = '';
+            this._slaveHb = {};
+            return;
+        }
+        const prev = this._slaveHb || {};
+        box.classList.add('has-peers');
+        box.innerHTML = peers.map((p, i) => {
+            const on = !!p.online;
+            const blink = on && p.hb && p.hb !== prev[p.id];
+            const tip = tipLines(
+                `${tr('MESH_RANK_SLAVE') ? tr('MESH_RANK_SLAVE').replace('%1', p.slot || (i + 1)) : `Slave ${p.slot || (i + 1)}`}`,
+                p.hostname || p.id || '',
+                meshIp(p.ip),
+                on ? (tr('MESH_ONLINE') || 'Online') : (tr('MESH_OFFLINE') || 'Offline'),
+                p.fw || ''
+            );
+            return icon(on, blink, tip);
+        }).join('');
+        this._slaveHb = {};
+        peers.forEach(p => { this._slaveHb[p.id] = p.hb; });
+    }
+    resetRanks() {
+        putJSON('/mesh/resetRanks', {}, (err, st) => {
+            if (err) return ui.serviceError(err);
+            if (st) { this.state = st; this.render(); }
+        });
+    }
+    unpair(id) {
+        putJSON('/mesh/unpair', { id }, (err, st) => {
+            if (err) return ui.serviceError(err);
+            if (st) { this.state = st; this.render(); }
+        });
+    }
+    pushUpdate(id) {
+        putJSON('/mesh/pushUpdate', { peer: id || 'all', ver: 'current', now: true }, (err, st) => {
+            if (err) return ui.serviceError(err);
+            this.watchOta();
+            this.loadState();
+        });
+    }
+    pushUpdateAll() { this.pushUpdate('all'); }
+    watchOta() {
+        if (this._otaTimer) return;
+        this._otaTimer = setInterval(() => {
+            getJSON('/mesh/state', (err, st) => {
+                if (err || !st) return;
+                this.state = st;
+                this.render();
+                const busy = (st.peers || []).some(p => p.phase === 'flashing' || p.phase === 'rebooting' || p.phase === 'queued');
+                if (!busy && !st.otaFollow) {
+                    clearInterval(this._otaTimer);
+                    this._otaTimer = null;
+                }
+            });
+        }, 2500);
+    }
+    renamePeer(el) {
+        const id = el.getAttribute('data-id');
+        const hostname = (el.value || '').trim();
+        const prev = ((this.state.peers || []).find(p => p.id === id) || {}).hostname || '';
+        if (!hostname || !/^[a-zA-Z0-9-]+$/.test(hostname) || hostname.length > 32) {
+            el.value = prev;
+            ui.errorMessage(tr('ERR_HOSTNAME')).querySelector('.sub-message').innerHTML = tr('ERR_HOSTNAME_CHARS');
+            return;
+        }
+        putJSON('/mesh/peerName', { id, hostname }, (err, st) => {
+            if (err) {
+                el.value = prev;
+                return ui.serviceError(err);
+            }
+            if (st) { this.state = st; this.render(); }
+        });
+    }
+    repair() {
+        const ip = (get('fldMeshRouterIp').value || '').trim();
+        const user = (get('fldMeshRouterUser').value || '').trim();
+        const pass = get('fldMeshRouterPass').value || '';
+        if (!ip) return ui.serviceError(tr('MESH_NEED_IP') || 'Enter the Router IP.');
+        putJSON('/mesh/role', { role: 2, routerIp: ip, routerId: this.state.routerId || '', user, pass }, (err) => {
+            if (err) return ui.serviceError(err);
+            this.loadState();
+        });
+    }
+    activityDevice(frame, dir) {
+        if (frame && frame.src) return frame.src;
+        if (dir === 'TX') {
+            const pick = Number(frame && frame.pick);
+            if (pick > 0) {
+                const peers = (this.state && this.state.peers) || [];
+                const p = peers.find(x => Number(x.slot) === pick) || peers[pick - 1];
+                const host = p ? (p.hostname || p.id || '') : '';
+                return host ? `Slave ${pick} · ${host}` : `Slave ${pick}`;
+            }
+            return tr('MESH_RANK_THIS') || 'This unit';
+        }
+        return tr('MESH_RANK_THIS') || 'This unit';
+    }
+    activityShade(frame) {
+        const addr = Number(frame && frame.address);
+        if (!addr) return '';
+        const shades = (typeof somfy !== 'undefined' && Array.isArray(somfy.shades)) ? somfy.shades : [];
+        for (const s of shades) {
+            if (!s || s.shadeId == null) continue;
+            if (Number(s.remoteAddress) === addr) return this.shadeLabel(s.shadeId);
+            const linked = s.linkedRemotes || [];
+            for (const r of linked) {
+                if (r && Number(r.remoteAddress) === addr) return this.shadeLabel(s.shadeId);
+            }
+        }
+        const groups = (typeof somfy !== 'undefined' && Array.isArray(somfy.groups)) ? somfy.groups : [];
+        for (const g of groups) {
+            if (!g || Number(g.remoteAddress) !== addr) continue;
+            const room = this.surveyRoomName(g);
+            const name = String(g.name || g.groupId || addr);
+            return room ? `${room} — ${name}` : name;
+        }
+        return '';
+    }
+    activityDeviceHtml(frame, dir, esc) {
+        const raw = this.activityDevice(frame, dir) || '';
+        const sep = ' · ';
+        const i = raw.indexOf(sep);
+        const role = i > 0 ? raw.slice(0, i) : raw;
+        const host = i > 0 ? raw.slice(i + sep.length) : '';
+        if (!role) return '—';
+        const rl = role.toLowerCase();
+        const kind = rl.startsWith('slave') ? 'slave' : (rl.startsWith('router') ? 'router' : 'this');
+        const chip = `<span class="mesh-role mesh-role-${kind}">${esc(role)}</span>`;
+        return host ? `${chip}<span class="mesh-device-host">${esc(host)}</span>` : chip;
+    }
+    rssiClass(rssi) {
+        if (rssi >= -60) return 'mesh-rssi-good';
+        if (rssi >= -85) return 'mesh-rssi-mid';
+        return 'mesh-rssi-poor';
+    }
+    logFrame(dir, frame) {
+        const list = get('divMeshFrames');
+        if (!list) return;
+        const dt = new Date();
+        const timeStr = `${dt.getHours().toString().padStart(2, '0')}:${dt.getMinutes().toString().padStart(2, '0')}:${dt.getSeconds().toString().padStart(2, '0')}`;
+        const cmd = frame.cmd || frame.command || '';
+        const row = document.createElement('div');
+        row.className = 'frame-row mesh-frame-row';
+        const esc = s => String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+        const device = this.activityDevice(frame, dir);
+        const shade = this.activityShade(frame);
+        const dirClass = dir === 'TX' ? 'mesh-dir mesh-dir-tx' : 'mesh-dir mesh-dir-rx';
+        const rssiOk = frame.rssi != null && frame.rssi > -127;
+        const rssiHtml = rssiOk ? `<span class="${this.rssiClass(frame.rssi)}">${frame.rssi}</span>` : '<span></span>';
+        row.innerHTML = `<span class="${dirClass}">${dir}</span><span class="frame-src mesh-device" title="${esc(device)}">${this.activityDeviceHtml(frame, dir, esc)}</span><span class="frame-src" title="${esc(shade)}">${esc(shade) || '—'}</span><span>${frame.address || ''}</span><span>${esc(cmd)}</span>${rssiHtml}<span title="${timeStr}">${timeStr}</span>`;
+        list.prepend(row);
+        while (list.children.length > 80) list.removeChild(list.lastChild);
+        this.refreshActivityChrome();
+    }
+    clearActivity() {
+        const list = get('divMeshFrames');
+        if (list) list.innerHTML = '';
+        this.refreshActivityChrome();
+    }
+    refreshActivityChrome() {
+        const list = get('divMeshFrames');
+        const empty = get('divMeshActivityEmpty');
+        const count = get('spanMeshActivityCount');
+        const n = list ? list.children.length : 0;
+        if (empty) empty.style.display = n ? 'none' : '';
+        if (count) count.textContent = n ? String(n) : '';
+        const log = list && list.closest('.mesh-activity-log');
+        if (log) log.classList.toggle('is-empty', !n);
+    }
+}
+var mesh = new MeshUi();

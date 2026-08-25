@@ -1,8 +1,13 @@
+/**
+ * GitOTA.cpp — GitHub release download and dual-partition firmware/filesystem OTA.
+ */
+
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Update.h>
 #include <HTTPClient.h>
 #include <esp_task_wdt.h>
+#include <LittleFS.h>
 #include "ConfigSettings.h"
 #include "GitOTA.h"
 #include "Utils.h"
@@ -11,7 +16,9 @@
 #include "Web.h"
 #include "WResp.h"
 #include "Network.h"
-
+#include "FixedCode.h"
+#include "NoLog.h"
+#include "MQTT.h"
 
 extern ConfigSettings settings;
 extern SocketEmitter sockEmit;
@@ -19,7 +26,8 @@ extern SomfyShadeController somfy;
 extern rebootDelay_t rebootDelay;
 extern Web webServer;
 extern Network net;
-
+extern FixedCodeController fixedCodes;
+extern MQTTClass mqtt;
 
 #define MAX_BUFF_SIZE 4096
 void GitRelease::setReleaseProperty(const char *key, const char *val) {
@@ -35,46 +43,63 @@ void GitRelease::setReleaseProperty(const char *key, const char *val) {
     this->releaseDate = Timestamp::parseUTCTime(val);
   }
 }
-void GitRelease::setAssetProperty(const char *key, const char *val) {
-  if(strcmp(key, "name") == 0) {
-    if(strstr(val, "littlefs.bin")) this->hasFS = true;
-    else if(strstr(val, "ino.esp32.bin")) {
-      if(strlen(this->hwVersions)) strcat(this->hwVersions, ",");
-      strcat(this->hwVersions, "32");
-    }
-    else if(strstr(val, "ino.esp32wrover.bin")) {
-      if(strlen(this->hwVersions)) strcat(this->hwVersions, ",");
-      strcat(this->hwVersions, "wrover");
-    }
-    else if(strstr(val, "ino.esp32s3_4mb.bin")) {
-      if(strlen(this->hwVersions)) strcat(this->hwVersions, ",");
-      strcat(this->hwVersions, "s3_4mb");
-    }
-    else if(strstr(val, "ino.esp32s3_8mb.bin")) {
-      if(strlen(this->hwVersions)) strcat(this->hwVersions, ",");
-      strcat(this->hwVersions, "s3_8mb");
-    }
-    else if(strstr(val, "ino.esp32s2.bin")) {
-      if(strlen(this->hwVersions)) strcat(this->hwVersions, ",");
-      strcat(this->hwVersions, "s2");
-    }
-    else if(strstr(val, "ino.esp32c3.bin")) {
-      if(strlen(this->hwVersions)) strcat(this->hwVersions, ",");
-      strcat(this->hwVersions, "c3");
-    }
-    else if(strstr(val, "ino.esp32c2.bin")) {
-      if(strlen(this->hwVersions)) strcat(this->hwVersions, ",");
-      strcat(this->hwVersions, "c2");
-    }
-    else if(strstr(val, "ino.esp32c6.bin")) {
-      if(strlen(this->hwVersions)) strcat(this->hwVersions, ",");
-      strcat(this->hwVersions, "c6");
-    }
-    else if(strstr(val, "ino.esp32h2.bin")) {
-      if(strlen(this->hwVersions)) strcat(this->hwVersions, ",");
-      strcat(this->hwVersions, "h2");
-    }
+static bool gitAssetMatchesChip(const char *name, const char *chip) {
+  char exact[48];
+  char prefixed[48];
+  snprintf(exact, sizeof(exact), "ino.%s.bin", chip);
+  snprintf(prefixed, sizeof(prefixed), "ino.%s-", chip);
+  return strstr(name, exact) != nullptr || strstr(name, prefixed) != nullptr;
+}
+
+static void gitAddHwVersion(char *hwVersions, size_t hwSz, const char *token) {
+  if(!hwVersions || !token) return;
+  if(strlen(hwVersions) + strlen(token) + 2 >= hwSz) return;
+  if(hwVersions[0]) strcat(hwVersions, ",");
+  strcat(hwVersions, token);
+}
+
+/** Insert -<version> before the final extension: base.bin → base-v3.4.2.bin */
+static void gitBuildVersionedAsset(char *out, size_t outSz, const char *baseName, const char *version) {
+  if(!out || !outSz) return;
+  if(!baseName || !baseName[0]) {
+    out[0] = '\0';
+    return;
   }
+  if(!version || !version[0]) {
+    strlcpy(out, baseName, outSz);
+    return;
+  }
+  const char *dot = strrchr(baseName, '.');
+  if(!dot || dot == baseName) {
+    strlcpy(out, baseName, outSz);
+    return;
+  }
+  char ver[24];
+  if(version[0] == 'v' || version[0] == 'V')
+    strlcpy(ver, version, sizeof(ver));
+  else {
+    ver[0] = 'v';
+    strlcpy(ver + 1, version, sizeof(ver) - 1);
+  }
+  size_t stemLen = (size_t)(dot - baseName);
+  snprintf(out, outSz, "%.*s-%s%s", (int)stemLen, baseName, ver, dot);
+}
+
+void GitRelease::setAssetProperty(const char *key, const char *val) {
+  if(strcmp(key, "name") != 0 || !val) return;
+  // Accept legacy names (…esp32.bin) and versioned names (…esp32-v3.4.2.bin).
+  if(strstr(val, "littlefs") && strstr(val, ".bin")) {
+    this->hasFS = true;
+  }
+  else if(gitAssetMatchesChip(val, "esp32wrover")) gitAddHwVersion(this->hwVersions, sizeof(this->hwVersions), "wrover");
+  else if(gitAssetMatchesChip(val, "esp32s3_8mb")) gitAddHwVersion(this->hwVersions, sizeof(this->hwVersions), "s3_8mb");
+  else if(gitAssetMatchesChip(val, "esp32s3_4mb")) gitAddHwVersion(this->hwVersions, sizeof(this->hwVersions), "s3_4mb");
+  else if(gitAssetMatchesChip(val, "esp32s2")) gitAddHwVersion(this->hwVersions, sizeof(this->hwVersions), "s2");
+  else if(gitAssetMatchesChip(val, "esp32c3")) gitAddHwVersion(this->hwVersions, sizeof(this->hwVersions), "c3");
+  else if(gitAssetMatchesChip(val, "esp32c2")) gitAddHwVersion(this->hwVersions, sizeof(this->hwVersions), "c2");
+  else if(gitAssetMatchesChip(val, "esp32c6")) gitAddHwVersion(this->hwVersions, sizeof(this->hwVersions), "c6");
+  else if(gitAssetMatchesChip(val, "esp32h2")) gitAddHwVersion(this->hwVersions, sizeof(this->hwVersions), "h2");
+  else if(gitAssetMatchesChip(val, "esp32")) gitAddHwVersion(this->hwVersions, sizeof(this->hwVersions), "32");
 }
 void GitRelease::toJSON(JsonResponse &json) {
   Timestamp ts;
@@ -102,7 +127,7 @@ int16_t GitRepo::getReleases(uint8_t num) {
   uint8_t count = min((uint8_t)GIT_MAX_RELEASES, num);
   char url[128];
   memset(this->releases, 0x00, sizeof(GitRelease) * GIT_MAX_RELEASES);
-  sprintf(url, "https://api.github.com/repos/xkain/ESPSomfy-RTS/releases?per_page=%d&page=1", count);
+  sprintf(url, "https://api.github.com/repos/" GITHUB_OWNER_REPO "/releases?per_page=%d&page=1", count);
   HTTPClient https;
   https.setReuse(false);
   if(https.begin(sclient, url)) {
@@ -291,7 +316,12 @@ void GitUpdater::checkForUpdate() {
       this->emitUpdateCheck();
     }
   }
+  bool doAuto = this->updateAvailable && settings.autoInstallUpdate && this->latest.name[0];
   this->status = GIT_STATUS_READY;
+  if(doAuto) {
+    strlcpy(this->targetRelease, this->latest.name, sizeof(this->targetRelease));
+    this->status = GIT_AWAITING_UPDATE;
+  }
 }
 void GitUpdater::setCurrentRelease(GitRepo &repo) {
   this->updateAvailable = false;
@@ -354,7 +384,7 @@ int GitUpdater::checkInternet() {
   esp_task_wdt_reset();
   HTTPClient https;
   https.setReuse(false);
-  if(https.begin(sclient, "https://github.com/xkain/ESPSomfy-RTS")) {
+  if(https.begin(sclient, "https://github.com/" GITHUB_OWNER_REPO)) {
     https.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
     https.setTimeout(3000);
     esp_task_wdt_reset();
@@ -388,12 +418,6 @@ void GitUpdater::emitDownloadProgress(uint8_t num, size_t total, size_t loaded, 
   json->addElem("error", (uint32_t)this->error);
   json->endObject();
   sockEmit.endEmit(num);
-  /*
-   * char buf[420];
-   * snprintf(buf, sizeof(buf), "{\"ver\":\"%s\",\"part\":%d,\"file\":\"%s\",\"total\":%d,\"loaded\":%d, \"error\":%d}", this->targetRelease, this->partition, this->currentFile, total, loaded, this->error);
-   * if(num >= 255) sockEmit.sendToClients(evt, buf);
-   * else sockEmit.sendToClient(num, evt, buf);
-   */
   sockEmit.loop();
   webServer.loop();
 }
@@ -430,36 +454,77 @@ void GitUpdater::setFirmwareFile() {
       break;
   }
 }
+void GitUpdater::setFirmwareAsset(const char *version) {
+  char base[64];
+  this->setFirmwareFile();
+  strlcpy(base, this->currentFile, sizeof(base));
+  gitBuildVersionedAsset(this->currentFile, sizeof(this->currentFile), base, version);
+}
+void GitUpdater::setFilesystemAsset(const char *version) {
+  gitBuildVersionedAsset(
+    this->currentFile, sizeof(this->currentFile),
+    "SomfyController.littlefs.bin", version);
+}
 bool GitUpdater::beginUpdate(const char *version) {
   Serial.println("Begin update called...");
-  sprintf(this->baseUrl, "https://github.com/xkain/ESPSomfy-RTS/releases/download/%s/", version);
+  sprintf(this->baseUrl, "https://github.com/" GITHUB_OWNER_REPO "/releases/download/%s/", version);
 
   strcpy(this->targetRelease, version);
   this->emitUpdateCheck();
-  this->setFirmwareFile();
   this->partition = U_FLASH;
   this->lockFS = this->cancelled = false;
   this->error = 0;
+  webServer.pendingFwRollback = false;
+  // Same as web Manual Update: RF ISR + MQTT must not run while flash is busy.
+  somfy.transceiver.end();
+  mqtt.end();
+
+  // Prefer versioned asset names; fall back to legacy unversioned names.
+  this->setFirmwareAsset(version);
   this->error = this->downloadFile();
+  if(this->error == ERR_HTTP_NOT_FOUND) {
+    Serial.println("Versioned firmware asset missing - trying legacy name");
+    this->setFirmwareFile();
+    this->error = this->downloadFile();
+  }
 
-  if(this->error == 0 && !this->cancelled) {
+  bool fwFlashed = (this->error == 0 && !this->cancelled);
+  if(fwFlashed) {
     somfy.commit();
+    // New FW is boot target after Update.end; roll back if FS stage fails.
+    webServer.pendingFwRollback = true;
 
-    strcpy(this->currentFile, "SomfyController.littlefs.bin");
     this->partition = U_SPIFFS;
     this->lockFS = true;
+    this->setFilesystemAsset(version);
     this->error = this->downloadFile();
+    if(this->error == ERR_HTTP_NOT_FOUND) {
+      Serial.println("Versioned LittleFS asset missing - trying legacy name");
+      strlcpy(this->currentFile, "SomfyController.littlefs.bin", sizeof(this->currentFile));
+      this->error = this->downloadFile();
+    }
     this->lockFS = false;
 
     if(this->error == 0) {
       settings.fwVersion.parse(version);
       delay(100);
       Serial.println("Committing Configuration...");
-      somfy.commit();
+      // FS image already remounted by validateFilesystem(); rewrite user data.
+      if(!webServer.remountAndRestoreUserConfig()) {
+        Serial.println("Filesystem update remount/restore failed - recovering shade data, not rebooting");
+        webServer.recoverUserConfigAfterFsFailure();
+        webServer.rollbackPendingFirmware();
+        this->error = -20;
+      } else {
+        rebootDelay.reboot = true;
+        rebootDelay.rebootTime = millis() + 2000;
+      }
     }
-
-    rebootDelay.reboot = true;
-    rebootDelay.rebootTime = millis() + 500;
+    else {
+      Serial.printf("Filesystem update failed (error %d) - restoring shade data and rolling back firmware boot\n", this->error);
+      webServer.recoverUserConfigAfterFsFailure();
+      webServer.rollbackPendingFirmware();
+    }
   }
 
   this->status = GIT_UPDATE_COMPLETE;
@@ -467,24 +532,59 @@ bool GitUpdater::beginUpdate(const char *version) {
   return true;
 }
 bool GitUpdater::recoverFilesystem() {
-  sprintf(this->baseUrl, "https://github.com/xkain/ESPSomfy-RTS/releases/download/%s/", settings.fwVersion.name);
-  strcpy(this->currentFile, "SomfyController.littlefs.bin");
+  sprintf(this->baseUrl, "https://github.com/" GITHUB_OWNER_REPO "/releases/download/%s/", settings.fwVersion.name);
   this->status = GIT_UPDATING;
   this->partition = U_SPIFFS;
   this->lockFS = true;
+  this->setFilesystemAsset(settings.fwVersion.name);
   this->error = this->downloadFile();
+  if(this->error == ERR_HTTP_NOT_FOUND) {
+    strlcpy(this->currentFile, "SomfyController.littlefs.bin", sizeof(this->currentFile));
+    this->error = this->downloadFile();
+  }
   this->lockFS = false;
   if(this->error == 0) {
     delay(100);
     Serial.println("Committing Configuration...");
-    somfy.commit();
+    if(!webServer.remountAndRestoreUserConfig()) {
+      Serial.println("Filesystem recovery remount/restore failed - restoring shade data, not rebooting");
+      webServer.recoverUserConfigAfterFsFailure();
+      this->error = -20;
+    } else {
+      rebootDelay.reboot = true;
+      rebootDelay.rebootTime = millis() + 2000;
+    }
+  }
+  else {
+    Serial.printf("Filesystem recovery failed (error %d) - restoring shade data, not rebooting\n", this->error);
+    webServer.recoverUserConfigAfterFsFailure();
   }
   this->status = GIT_UPDATE_COMPLETE;
-  rebootDelay.reboot = true;
-  rebootDelay.rebootTime = millis() + 500;
   return true;
 }
 bool GitUpdater::endUpdate() { return true; }
+// Mounts the LittleFS partition just written by Update.write()/Update.end()
+// and confirms it actually holds a usable web UI, rather than trusting the
+// downloaded-byte-count check alone. A truncated or bit-corrupted stream can
+// still land on the expected total size while producing an unmountable or
+// empty filesystem (the "Corrupted dir pair" failure mode reported in
+// https://github.com/rstrouse/ESPSomfy-RTS/issues/493 and /579). Returning
+// false here means the caller must NOT reboot into this partition.
+bool GitUpdater::validateFilesystem() {
+  LittleFS.end();
+  if(!LittleFS.begin(false)) {
+    Serial.println("LittleFS validation: partition did not mount after update");
+    return false;
+  }
+  bool ok = LittleFS.exists("/index.html");
+  if(ok) {
+    File f = LittleFS.open("/index.html", "r");
+    ok = f && f.size() > 0;
+    if(f) f.close();
+  }
+  if(!ok) Serial.println("LittleFS validation: mounted, but /index.html is missing or empty");
+  return ok;
+}
 int8_t GitUpdater::downloadFile() {
   Serial.printf("Begin update %s\n", this->currentFile);
   WiFiClientSecure sclient;
@@ -494,110 +594,124 @@ int8_t GitUpdater::downloadFile() {
   sprintf(url, "%s%s", this->baseUrl, this->currentFile);
   Serial.println(url);
   esp_task_wdt_reset();
-  if(https.begin(sclient, url)) {
-    https.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-    Serial.print("[HTTPS] GET...\n");
-    int httpCode = https.GET();
-    if(httpCode > 0) {
-      size_t len = https.getSize();
-      size_t total = 0;
-      uint8_t pct = 0;
-      Serial.printf("[HTTPS] GET... code: %d - %d\n", httpCode, len);
-      if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY || httpCode == HTTP_CODE_FOUND) {
-        WiFiClient *stream = https.getStreamPtr();
-        if(!Update.begin(len, this->partition)) {
-          Serial.println("Update Error detected!!!!!");
-          Update.printError(Serial);
-          https.end();
-          return -(Update.getError() + UPDATE_ERR_OFFSET);
-        }
-        uint8_t *buff = (uint8_t *)malloc(MAX_BUFF_SIZE);
-        if(buff) {
-          this->emitDownloadProgress(len, total);
-          int timeouts = 0;
-          while(https.connected() && (len > 0 || len == -1) && total < len) {
-            size_t size = stream->available();
-            esp_task_wdt_reset();
-            if(size) {
-              timeouts = 0;
-              if(this->cancelled && !this->lockFS) {
-                Update.abort();
-                free(buff);
-                https.end();
-                return -(Update.getError() + UPDATE_ERR_OFFSET);
-              }
-              int c = stream->readBytes(buff, ((size > MAX_BUFF_SIZE) ? MAX_BUFF_SIZE : size));
-              total += c;
-              //Serial.println(total);
-              if (Update.write(buff, c) != c) {
-                Update.printError(Serial);
-                Serial.printf("Upload of %s aborted invalid size %d\n", url, c);
-                free(buff);
-                https.end();
-                sclient.stop();
-                return -(Update.getError() + UPDATE_ERR_OFFSET);
-              }
-              // Calculate the percentage.
-              uint8_t p = (uint8_t)floor(((float)total / (float)len) * 100.0f);
-              if(p != pct) {
-                pct = p;
-                Serial.printf("LEN:%d TOTAL:%d %d%%\n", len, total, pct);
-                this->emitDownloadProgress(len, total);
-              }
-              delay(1);
-              if(total >= len) {
-                if(!Update.end(true)) {
-                  Serial.println("Error downloading update...");
-                  Update.printError(Serial);
-                }
-                else {
-                  Serial.println("Update.end Called...");
-                }
-                https.end();
-                sclient.stop();
-              }
-            }
-            else {
-              timeouts++;
-              if(timeouts >= 500) {
-                Update.abort();
-                https.end();
-                free(buff);
-                Serial.println("Stream timeout!!!");
-                return -43;
-              }
-              sockEmit.loop();
-              webServer.loop();
-              delay(100);
-            }
-          }
-          free(buff);
-          if(len > total) {
-            Update.abort();
-            somfy.commit();
-            Serial.println("Error downloading file!!!");
-            return -42;
-          }
-          else
-            Serial.printf("Update %s complete\n", this->currentFile);
-        }
-        else {
-          // TODO: memory allocation error.
-          Serial.println("Unable to allocate memory for update!!!");
-        }
+  if(!https.begin(sclient, url)) {
+    Serial.println("HTTPS begin failed");
+    return -41;
+  }
+  https.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  Serial.print("[HTTPS] GET...\n");
+  int httpCode = https.GET();
+  if(httpCode <= 0) {
+    Serial.printf("Invalid HTTP Code: %d\n", httpCode);
+    https.end();
+    sclient.stop();
+    return httpCode == 0 ? -40 : (int8_t)httpCode;
+  }
+  size_t len = https.getSize();
+  size_t total = 0;
+  uint8_t pct = 0;
+  Serial.printf("[HTTPS] GET... code: %d - %d\n", httpCode, len);
+  if(httpCode != HTTP_CODE_OK && httpCode != HTTP_CODE_MOVED_PERMANENTLY && httpCode != HTTP_CODE_FOUND) {
+    Serial.printf("Invalid HTTP Code... %d\n", httpCode);
+    https.end();
+    sclient.stop();
+    if(httpCode == HTTP_CODE_NOT_FOUND) return ERR_HTTP_NOT_FOUND;
+    return (int8_t)((httpCode > 127) ? -(httpCode % 100) : httpCode);
+  }
+  WiFiClient *stream = https.getStreamPtr();
+  if(this->partition == U_SPIFFS) LittleFS.end();
+  if(!Update.begin(len, this->partition)) {
+    Serial.println("Update Error detected!!!!!");
+    int8_t err = -(Update.getError() + UPDATE_ERR_OFFSET);
+    https.end();
+    sclient.stop();
+    return err;
+  }
+  uint8_t *buff = (uint8_t *)malloc(MAX_BUFF_SIZE);
+  if(!buff) {
+    Serial.println("Unable to allocate memory for update!!!");
+    Update.abort();
+    https.end();
+    sclient.stop();
+    return -45;
+  }
+  this->emitDownloadProgress(len, total);
+  int timeouts = 0;
+  while(https.connected() && (len > 0 || len == -1) && total < len) {
+    size_t size = stream->available();
+    esp_task_wdt_reset();
+    if(size) {
+      timeouts = 0;
+      if(this->cancelled && !this->lockFS) {
+        Update.abort();
+        free(buff);
+        https.end();
+        sclient.stop();
+        return -(Update.getError() + UPDATE_ERR_OFFSET);
       }
-      else {
-        Serial.printf("Invalid HTTP Code... %d", httpCode);
-        return httpCode;
+      int c = stream->readBytes(buff, ((size > MAX_BUFF_SIZE) ? MAX_BUFF_SIZE : size));
+      total += c;
+      if(Update.write(buff, c) != c) {
+        Serial.printf("Upload of %s aborted invalid size %d\n", url, c);
+        int8_t err = -(Update.getError() + UPDATE_ERR_OFFSET);
+        Update.abort();
+        free(buff);
+        https.end();
+        sclient.stop();
+        return err;
+      }
+      uint8_t p = (uint8_t)floor(((float)total / (float)len) * 100.0f);
+      if(p != pct) {
+        pct = p;
+        Serial.printf("LEN:%d TOTAL:%d %d%%\n", len, total, pct);
+        this->emitDownloadProgress(len, total);
+      }
+      delay(1);
+      if(total >= len) {
+        if(!Update.end(true)) {
+          Serial.println("Error downloading update...");
+          int8_t err = -(Update.getError() + UPDATE_ERR_OFFSET);
+          free(buff);
+          https.end();
+          sclient.stop();
+          return err;
+        }
+        Serial.println("Update.end Called...");
+        https.end();
+        sclient.stop();
       }
     }
     else {
-      Serial.printf("Invalid HTTP Code: %d\n", httpCode);
+      timeouts++;
+      if(timeouts >= 500) {
+        Update.abort();
+        free(buff);
+        https.end();
+        sclient.stop();
+        Serial.println("Stream timeout!!!");
+        return -43;
+      }
+      sockEmit.loop();
+      webServer.loop();
+      delay(100);
     }
-    https.end();
-    sclient.stop();
-    Serial.printf("End update %s\n", this->currentFile);
   }
+  free(buff);
+  if(len > total) {
+    Update.abort();
+    Serial.println("Error downloading file!!!");
+    return -42;
+  }
+  Serial.printf("Update %s complete\n", this->currentFile);
+  // Byte count matching len does not guarantee the written data is
+  // actually a valid filesystem -- a truncated/garbled stream can still
+  // land on the expected total. Mount and sanity-check it before we
+  // let the caller commit to rebooting into it.
+  if(this->partition == U_SPIFFS && !this->validateFilesystem()) {
+    Serial.println("LittleFS validation failed after update - refusing to commit");
+    return ERR_FS_VALIDATION;
+  }
+  Serial.printf("End update %s\n", this->currentFile);
   esp_task_wdt_reset();
   return 0;
 }

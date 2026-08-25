@@ -1,9 +1,34 @@
+/**
+ * ConfigSettings.h — Settings structs and FW_VERSION.
+ */
+
 #include <ArduinoJson.h>
 #include <ETH.h>
 #ifndef configsettings_h
 #define configsettings_h
 #include "WResp.h"
-#define FW_VERSION "v2.5.6"
+#define FW_VERSION "v3.4.5"
+#ifndef LIB_CC1101_VER
+#define LIB_CC1101_VER "3.0.2"
+#endif
+#ifndef LIB_ARDUINOJSON_VER
+#define LIB_ARDUINOJSON_VER "6.21.5"
+#endif
+#ifndef LIB_PUBSUB_VER
+#define LIB_PUBSUB_VER "2.8.0"
+#endif
+#ifndef LIB_ASYNCWS_VER
+#define LIB_ASYNCWS_VER "3.11.2"
+#endif
+#ifndef LIB_ASYNCTCP_VER
+#define LIB_ASYNCTCP_VER "3.4.10"
+#endif
+#ifndef LIB_WEBSOCKETS_VER
+#define LIB_WEBSOCKETS_VER "2.4.1"
+#endif
+#ifndef LIB_PIO_PLATFORM
+#define LIB_PIO_PLATFORM "espressif32@6.8.1"
+#endif
 enum class conn_types_t : byte {
     unset = 0x00,
     wifi = 0x01,
@@ -24,6 +49,8 @@ struct restore_options_t {
   bool transceiver = false;
   bool repeaters = false;
   bool mqtt = false;
+  bool fixedCodes = false;
+  bool automation = false;
   void fromJSON(JsonObject &obj);
 };
 struct appver_t {
@@ -73,7 +100,7 @@ class WifiSettings: BaseSettings {
     bool hidden = false;
     char ssid[65] = "";
     char passphrase[65] = "";
-    //bool ssdpBroadcast = true;
+
     bool begin();
     bool fromJSON(JsonObject &obj);
     bool toJSON(JsonObject &obj);
@@ -169,12 +196,14 @@ class ConfigSettings: BaseSettings {
     char serverId[10] = "";
     char hostname[32] = "ESPSomfyRTS";
     char chipModel[10] = "ESP32";
-    char accentColor[8] = "#1a5fb4";
+    char accentColor[8] = "#009BFF";
     conn_types_t connType = conn_types_t::unset;
     appver_t fwVersion;
     appver_t appVersion;
     bool ssdpBroadcast = true;
-    bool checkForUpdate = true;
+    bool checkForUpdate = false;
+    bool autoInstallUpdate = false;
+    bool alexaHueEnabled = false;
     bool swShowGpio = false;
     uint8_t status;
     uint8_t language = 0;

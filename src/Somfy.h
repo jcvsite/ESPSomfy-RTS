@@ -1,14 +1,19 @@
+/**
+ * Somfy.h — Declarations for shade/group/room controllers, frames, transceiver, and capacity limits.
+ */
+
 #ifndef SOMFY_H
 #define SOMFY_H
 #include "ConfigSettings.h"
 #include "WResp.h"
 
-#define SOMFY_MAX_SHADES 32
+#define SOMFY_MAX_SHADES 48
 #define SOMFY_MAX_GROUPS 16
-#define SOMFY_MAX_LINKED_REMOTES 7
+#define SOMFY_MAX_LINKED_REMOTES 11
 #define SOMFY_MAX_GROUPED_SHADES 32
-#define SOMFY_MAX_ROOMS 16
+#define SOMFY_MAX_ROOMS 24
 #define SOMFY_MAX_REPEATERS 7
+#define SOMFY_NAME_LEN 33 // 32 visible characters + NUL
 
 #define SECS_TO_MILLIS(x) ((x) * 1000)
 #define MINS_TO_MILLIS(x) SECS_TO_MILLIS((x) * 60)
@@ -19,7 +24,13 @@
 #define SOMFY_WIND_TIMEOUT SECS_TO_MILLIS(2)
 #define SOMFY_NO_WIND_TIMEOUT MINS_TO_MILLIS(12)
 #define SOMFY_NO_WIND_REMOTE_TIMEOUT SECS_TO_MILLIS(30)
-
+// Physical remotes force My / reverse with ~3 identical frames (same rolling code).
+// sendFrame() does 1 initial + N follow-ups → N=2 yields 3 total.
+#ifndef SOMFY_FORCE_CMD_REPEATS
+#define SOMFY_FORCE_CMD_REPEATS      2
+#endif
+// After RF My, wait before the reverse frame so the motor registers the stop.
+#define SOMFY_STOP_BEFORE_REVERSE_MS 400
 
 enum class radio_proto : byte { // Ordinal byte 0-255
   RTS = 0x00,
@@ -103,6 +114,7 @@ struct somfy_rx_t {
       memset(this->payload, 0, sizeof(this->payload));
       memset(this->pulses, 0, sizeof(this->pulses));
       this->pulseCount = 0;
+      this->rssi = -127;
     }
     t_status status;
     uint8_t bit_length = 56;
@@ -113,6 +125,7 @@ struct somfy_rx_t {
     uint8_t payload[10];
     unsigned int pulses[MAX_TIMINGS];
     uint16_t pulseCount = 0;
+    int16_t rssi = -127;
 };
 // A simple FIFO queue to hold rx buffers.  We are using
 // a byte index to make it so we don't have to reorganize
@@ -204,7 +217,7 @@ struct somfy_frame_t {
 class SomfyRoom {
   public:
     uint8_t roomId = 0;
-    char name[21] = "";
+    char name[SOMFY_NAME_LEN] = "";
     int8_t sortOrder = 0;
     void clear();
     bool save();
@@ -250,14 +263,14 @@ class SomfyRemote {
     void setSunSensor(bool bHasSensor);
     void setLight(bool bHasLight);
     void setSimMy(bool bSimMy);
-    virtual void sendCommand(somfy_commands cmd);
-    virtual void sendCommand(somfy_commands cmd, uint8_t repeat, uint8_t stepSize = 0);
+    virtual bool sendCommand(somfy_commands cmd);
+    virtual bool sendCommand(somfy_commands cmd, uint8_t repeat, uint8_t stepSize = 0);
     void sendSensorCommand(int8_t isWindy, int8_t isSunny, uint8_t repeat);
     void repeatFrame(uint8_t repeat);
     virtual uint16_t p_lastRollingCode(uint16_t code);
     somfy_commands transformCommand(somfy_commands cmd);
     virtual void triggerGPIOs(somfy_frame_t &frame);
-   
+  protected:
 };
 class SomfyLinkedRemote : public SomfyRemote {
   public:
@@ -283,10 +296,17 @@ class SomfyShade : public SomfyRemote {
     bool settingPos = false;
     bool settingTiltPos = false;
     uint32_t awaitMy = 0;
+    // While millis() < moveActiveUntil, My must halt (not seek favorite). Covers the
+    // case where estimated position already hit 0/100 but the motor is still running.
+    uint32_t moveActiveUntil = 0;
+    void markMoveActive();
+    void clearMoveActive();
   public:
+    bool motorLikelyMoving() const;
     uint8_t roomId = 0;
     int8_t sortOrder = 0;
     bool flipPosition = false;
+    bool exposeAlexa = false;
     shade_types shadeType = shade_types::roller;
     tilt_types tiltType = tilt_types::none;
     #ifdef USE_NVS
@@ -308,7 +328,7 @@ class SomfyShade : public SomfyRemote {
     int8_t fromJSON(JsonObject &obj);
     void toJSON(JsonResponse &json) override;
     
-    char name[21] = "";
+    char name[SOMFY_NAME_LEN] = "";
     void setShadeId(uint8_t id) { shadeId = id; }
     uint8_t getShadeId() { return shadeId; }
     uint32_t upTime = 10000;
@@ -317,6 +337,13 @@ class SomfyShade : public SomfyRemote {
     uint16_t stepSize = 100;
     bool save();
     bool isIdle();
+    bool stopIfMoving();
+    // True when a move cmd would reverse while lift/tilt is already moving.
+    bool needsStopBeforeReverse(somfy_commands cmd) const;
+    // Send My, freeze estimate, then pause so the motor accepts the new direction.
+    void stopForDirectionChange();
+    // Set reported position/tilt without moving the motor; clears motion estimation.
+    void calibratePosition(int pos, int tiltPos = -1);
     bool isInGroup();
     void checkMovement();
     void processFrame(somfy_frame_t &frame, bool internal = false);
@@ -325,12 +352,12 @@ class SomfyShade : public SomfyRemote {
     void setMovement(int8_t dir);
     void setTarget(float target);
     bool isAtTarget();
-    bool isToggle();
-    void moveToTarget(float pos, float tilt = -1.0f);
+    bool isToggle() const;
+    bool moveToTarget(float pos, float tilt = -1.0f);
     void moveToTiltTarget(float target);
     void sendTiltCommand(somfy_commands cmd);
-    void sendCommand(somfy_commands cmd);
-    void sendCommand(somfy_commands cmd, uint8_t repeat, uint8_t stepSize = 0);
+    bool sendCommand(somfy_commands cmd);
+    bool sendCommand(somfy_commands cmd, uint8_t repeat, uint8_t stepSize = 0);
     bool linkRemote(uint32_t remoteAddress, uint16_t rollingCode = 0);
     bool unlinkRemote(uint32_t remoteAddress);
     void emitState(const char *evt = "shadeState");
@@ -385,14 +412,14 @@ class SomfyGroup : public SomfyRemote {
     int8_t sortOrder = 0;
     group_types groupType = group_types::channel;
     int8_t direction = 0; // 0 = stopped, 1=down, -1=up.
-    char name[21] = "";
+    char name[SOMFY_NAME_LEN] = "";
     uint8_t linkedShades[SOMFY_MAX_GROUPED_SHADES];
     void setGroupId(uint8_t id) { groupId = id; }
     uint8_t getGroupId() { return groupId; }
     bool save();
     void clear();
     bool fromJSON(JsonObject &obj);
-    //bool toJSON(JsonObject &obj);
+
     void toJSON(JsonResponse &json);
     void toJSONRef(JsonResponse &json);
     
@@ -408,8 +435,8 @@ class SomfyGroup : public SomfyRemote {
     void updateFlags();
     void emitState(const char *evt = "groupState");
     void emitState(uint8_t num, const char *evt = "groupState");
-    void sendCommand(somfy_commands cmd);
-    void sendCommand(somfy_commands cmd, uint8_t repeat, uint8_t stepSize = 0);
+    bool sendCommand(somfy_commands cmd);
+    bool sendCommand(somfy_commands cmd, uint8_t repeat, uint8_t stepSize = 0);
     int8_t p_direction(int8_t dir);
     bool publish(const char *topic, uint8_t val, bool retain = false);
     bool publish(const char *topic, int8_t val, bool retain = false);
@@ -434,58 +461,8 @@ struct transceiver_config_t {
     float deviation = 47.60;          // Set the Frequency deviation in kHz. Value from 1.58 to 380.85. Default is 47.60 kHz.
     float rxBandwidth = 99.97;        // Receive bandwidth in kHz.  Value from 58.03 to 812.50.  Default is 99.97kHz.
     int8_t txPower = 10;              // Transmission power {-30, -20, -15, -10, -6, 0, 5, 7, 10, 11, 12}.  Default is 12.
-/*    
-    bool internalCCMode = false;      // Use internal transmission mode FIFO buffers.
-    byte modulationMode = 2;          // Modulation mode. 0 = 2-FSK, 1 = GFSK, 2 = ASK/OOK, 3 = 4-FSK, 4 = MSK.
-    uint8_t channel = 0;              // The channel number from 0 to 255
-    float channelSpacing = 199.95;    // Channel spacing in multiplied by the channel number and added to the base frequency in kHz. 25.39 to 405.45.  Default 199.95
-    float dataRate = 99.97;           // The data rate in kBaud.  0.02 to 1621.83 Default is 99.97.
-    uint8_t syncMode = 0;             // 0=No preamble/sync, 
-    // 1=16 sync word bits detected, 
-    // 2=16/16 sync words bits detected. 
-    // 3=30/32 sync word bits detected, 
-    // 4=No preamble/sync carrier above threshold
-    // 5=15/16 + carrier above threshold. 
-    // 6=16/16 + carrier-sense above threshold
-    // 7=0/32 + carrier-sense above threshold
-    uint16_t syncWordHigh = 211;      // The sync word used to the sync mode.
-    uint16_t syncWordLow = 145;       // The sync word used to the sync mode.
-    uint8_t addrCheckMode = 0;        // 0=No address filtration
-    // 1=Check address without broadcast.
-    // 2=Address check with 0 as broadcast.
-    // 3=Address check with 0 or 255 as broadcast.
-    uint8_t checkAddr = 0;            // Packet filter address depending on addrCheck settings.
-    bool dataWhitening = false;       // Indicates whether data whitening should be applied.
-    uint8_t pktFormat = 0;            // 0=Use FIFO buffers form RX and TX
-    // 1=Synchronous serial mode.  RX on GDO0 and TX on either GDOx pins.
-    // 2=Random TX mode.  Send data using PN9 generator.
-    // 3=Asynchronous serial mode.  RX on GDO0 and TX on either GDOx pins.
-    uint8_t pktLengthMode = 0;        // 0=Fixed packet length
-    // 1=Variable packet length
-    // 2=Infinite packet length
-    // 3=Reserved
-    uint8_t pktLength = 0;            // Packet length
-    bool useCRC = false;              // Indicates whether CRC is to be used.
-    bool autoFlushCRC = false;        // Automatically flush RX FIFO when CRC fails.  If more than one packet is in the buffer it too will be flushed.
-    bool disableDCFilter = false;     // Digital blocking filter for demodulator.  Only for data rates <= 250k.
-    bool enableManchester = true;     // Enable/disable Manchester encoding.
-    bool enableFEC = false;           // Enable/disable forward error correction.
-    uint8_t minPreambleBytes = 0;     // The minimum number of preamble bytes to be transmitten.
-    // 0=2bytes
-    // 1=3bytes
-    // 2=4bytes
-    // 3=6bytes
-    // 4=8bytes
-    // 5=12bytes
-    // 6=16bytes
-    // 7=24bytes
-    uint8_t pqtThreshold = 0;         // Preamble quality estimator threshold.  The preable quality estimator increase an internal counter by one each time a bit is received that is different than the prevoius bit and
-    // decreases the bounter by 8 each time a bit is received that is the same as the lats bit.  A threshold of 4 PQT for this counter is used to gate sync word detection.  
-    // When PQT = 0 a sync word is always accepted.
-    bool appendStatus = false;        // Appends the RSSI and LQI values to the TX packed as well as the CRC.
- */
     void fromJSON(JsonObject& obj);
-    //void toJSON(JsonObject& obj);
+
     void toJSON(JsonResponse& json);
     void save();
     void load();
@@ -500,7 +477,7 @@ class Transceiver {
   public:
     transceiver_config_t config;
     bool printBuffer = false;
-    //bool toJSON(JsonObject& obj);
+
     void toJSON(JsonResponse& json);
     bool fromJSON(JsonObject& obj);
     bool save();
@@ -513,13 +490,21 @@ class Transceiver {
     void disableReceive();
     somfy_frame_t& lastFrame();
     void sendFrame(byte *frame, uint8_t sync, uint8_t bitLength = 56);
+    void sendPulses(const uint16_t *pulses, uint16_t count);
     void beginTransmit();
     void endTransmit();
-    void emitFrame(somfy_frame_t *frame, somfy_rx_t *rx = nullptr);
+    void emitFrame(somfy_frame_t *frame, somfy_rx_t *rx = nullptr, const char *src = nullptr);
     void beginFrequencyScan();
     void endFrequencyScan();
     void processFrequencyScan(bool received = false);
     void emitFrequencyScan(uint8_t num = 255);
+    void beginFixedCodeLearn(float frequency);
+    void endFixedCodeLearn();
+    void processFixedCodeLearn();
+    bool isFixedCodeLearning() const;
+    uint16_t fixedCodeLearnPulseCount() const;
+    int16_t fixedCodeLearnRssi() const;
+    int16_t fixedCodeLearnPeakRssi() const;
     bool usesPin(uint8_t pin);
 };
 class SomfyShadeController {
@@ -553,8 +538,8 @@ class SomfyShadeController {
     void end();
     void compressRepeaters();
     uint32_t repeaters[SOMFY_MAX_REPEATERS] = {0};
-    SomfyRoom rooms[SOMFY_MAX_ROOMS];
-    SomfyShade shades[SOMFY_MAX_SHADES];
+    SomfyRoom *rooms;
+    SomfyShade *shades;
     SomfyGroup groups[SOMFY_MAX_GROUPS];
     bool linkRepeater(uint32_t address);
     bool unlinkRepeater(uint32_t address);
@@ -572,7 +557,7 @@ class SomfyShadeController {
     SomfyGroup * getGroupById(uint8_t groupId);
     SomfyShade * findShadeByRemoteAddress(uint32_t address);
     SomfyGroup * findGroupByRemoteAddress(uint32_t address);
-    void sendFrame(somfy_frame_t &frame, uint8_t repeats = 0);
+    void sendFrame(somfy_frame_t &frame, uint8_t repeats = 0, bool fromMesh = false);
     void processFrame(somfy_frame_t &frame, bool internal = false);
     void emitState(uint8_t num = 255);
     void publish();

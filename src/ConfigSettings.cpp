@@ -1,3 +1,7 @@
+/**
+ * ConfigSettings.cpp — NVS/settings load-save: hostname, security, NTP, update prefs, IP.
+ */
+
 #include <Arduino.h>
 #include <LittleFS.h>       // https://github.com/espressif/arduino-esp32/tree/master/libraries/LittleFS
 #include <time.h>
@@ -6,7 +10,7 @@
 #include "ConfigSettings.h"
 #include "Utils.h"
 #include "esp_chip_info.h"
-
+#include "NoLog.h"
 
 Preferences pref;
 
@@ -17,6 +21,8 @@ void restore_options_t::fromJSON(JsonObject &obj) {
   if(obj.containsKey("transceiver")) this->transceiver = obj["transceiver"];
   if(obj.containsKey("repeaters")) this->repeaters = obj["repeaters"];
   if(obj.containsKey("mqtt")) this->mqtt = obj["mqtt"];
+  if(obj.containsKey("fixedCodes")) this->fixedCodes = obj["fixedCodes"];
+  if(obj.containsKey("automation")) this->automation = obj["automation"];
 }
 int8_t appver_t::compare(appver_t &ver) {
   if(this->major == ver.major && this->minor == ver.minor && this->build == ver.build) return 0;
@@ -76,7 +82,7 @@ void appver_t::parse(const char *ver) {
       break;
   }
   this->build = static_cast<uint8_t>(atoi(num) & 0xFF);
-  if(strlen(ver) < i) strlcpy(this->suffix, &ver[i], sizeof(this->suffix));
+  if(strlen(ver) > i) strlcpy(this->suffix, &ver[i], sizeof(this->suffix));
 }
 bool appver_t::toJSON(JsonObject &obj) {
   obj["name"] = this->name;
@@ -154,18 +160,12 @@ bool ConfigSettings::begin() {
   esp_chip_info_t ci;
   esp_chip_info(&ci);
   switch(ci.model) {
-    /*
     case esp_chip_model_t::CHIP_ESP32:
-      strcpy(this->chipModel, "");
-      break;
-     */
-
-    case esp_chip_model_t::CHIP_ESP32:
-      // On vérifie si c'est un module avec PSRAM (WROVER) ou standard (WROOM)
+      // WROVER (PSRAM) vs WROOM — selects matching firmware asset name.
       if (psramFound()) {
         strcpy(this->chipModel, "wrover");
       } else {
-        strcpy(this->chipModel, ""); // Ou "32" selon vos préférences d'affichage
+        strcpy(this->chipModel, "");
       }
       break;
     case esp_chip_model_t::CHIP_ESP32S3: {
@@ -218,17 +218,35 @@ bool ConfigSettings::begin() {
   return true;
 }
 
-
-
 bool ConfigSettings::load() {
   this->fwVersion.parse(FW_VERSION);
   this->getAppVersion();
   pref.begin("CFG");
   pref.getString("hostname", this->hostname, sizeof(this->hostname));
   this->ssdpBroadcast = pref.getBool("ssdpBroadcast", true);
-  this->checkForUpdate = pref.getBool("checkForUpdate", true);
+  this->checkForUpdate = pref.getBool("checkForUpdate", false);
+  this->autoInstallUpdate = pref.getBool("autoInstall", false);
+  this->alexaHueEnabled = pref.getBool("alexaHue", false);
+  // One-time migration: previous builds defaulted auto-update on. Force it off once
+  // so existing NVS values do not keep polling GitHub after this change.
+  if(!pref.isKey("aupdOffMig")) {
+    this->checkForUpdate = false;
+    pref.putBool("checkForUpdate", false);
+    pref.putBool("aupdOffMig", true);
+  }
   pref.getString("accentColor", this->accentColor, sizeof(this->accentColor));
-  this->language = pref.getUChar("language", 0);
+  if(!pref.isKey("accentCyanMig")) {
+    if(!this->accentColor[0] || !strcmp(this->accentColor, "#1a5fb4") ||
+       !strcmp(this->accentColor, "#007AFF") || !strcmp(this->accentColor, "#B07903")) {
+      strncpy(this->accentColor, "#009BFF", sizeof(this->accentColor));
+      pref.putString("accentColor", this->accentColor);
+    }
+    pref.putBool("accentCyanMig", true);
+  }
+  if(!pref.isKey("accentGoldMig")) {
+    pref.putBool("accentGoldMig", true);
+  }
+  this->language = 0; // English-only UI
   this->swShowGpio = pref.getBool("swShowGpio", false);
   this->connType = static_cast<conn_types_t>(pref.getChar("connType", 0x00));
   //Serial.printf("Preference GFG Free Entries: %d\n", pref.freeEntries());
@@ -263,6 +281,8 @@ bool ConfigSettings::save() {
   pref.putBool("ssdpBroadcast", this->ssdpBroadcast);
   pref.putChar("connType", static_cast<uint8_t>(this->connType));
   pref.putBool("checkForUpdate", this->checkForUpdate);
+  pref.putBool("autoInstall", this->autoInstallUpdate);
+  pref.putBool("alexaHue", this->alexaHueEnabled);
   pref.putString("accentColor", this->accentColor);
   pref.putUChar("language", this->language);
   pref.putBool("swShowGpio", this->swShowGpio);
@@ -276,6 +296,8 @@ bool ConfigSettings::toJSON(JsonObject &obj) {
   obj["language"] = static_cast<uint8_t>(this->language);
   obj["chipModel"] = this->chipModel;
   obj["checkForUpdate"] = this->checkForUpdate;
+  obj["autoInstallUpdate"] = this->autoInstallUpdate;
+  obj["alexaHueEnabled"] = this->alexaHueEnabled;
 
   obj["accentColor"] = this->accentColor;
   obj["swShowGpio"] = this->swShowGpio;
@@ -288,8 +310,11 @@ void ConfigSettings::toJSON(JsonResponse &json) {
   json.addElem("language", static_cast<uint8_t>(this->language));
   json.addElem("chipModel", this->chipModel);
   json.addElem("checkForUpdate", this->checkForUpdate);
+  json.addElem("autoInstallUpdate", this->autoInstallUpdate);
+  json.addElem("alexaHueEnabled", this->alexaHueEnabled);
   json.addElem("accentColor", this->accentColor);
   json.addElem("swShowGpio", this->swShowGpio);
+  json.addElem("appVersion", this->appVersion.name);
 }
 
 bool ConfigSettings::requiresAuth() { return this->Security.type != security_types::None; }
@@ -297,9 +322,11 @@ bool ConfigSettings::fromJSON(JsonObject &obj) {
     if(obj.containsKey("ssdpBroadcast")) this->ssdpBroadcast = obj["ssdpBroadcast"];
     if(obj.containsKey("hostname")) this->parseValueString(obj, "hostname", this->hostname, sizeof(this->hostname));
     if(obj.containsKey("connType")) this->connType = static_cast<conn_types_t>(obj["connType"].as<uint8_t>());
-    // Changez ceci :
-    if(obj.containsKey("language")) this->language = obj["language"].as<uint8_t>();
+    this->language = 0; // English-only UI
     if(obj.containsKey("checkForUpdate")) this->checkForUpdate = obj["checkForUpdate"];
+    if(obj.containsKey("autoInstallUpdate")) this->autoInstallUpdate = obj["autoInstallUpdate"];
+    if(obj.containsKey("alexaHueEnabled")) this->alexaHueEnabled = obj["alexaHueEnabled"];
+    if(this->autoInstallUpdate) this->checkForUpdate = true;
     if(obj.containsKey("accentColor")) this->parseValueString(obj, "accentColor",this->accentColor, sizeof(this->accentColor));
     if(obj.containsKey("swShowGpio")) this->swShowGpio = obj["swShowGpio"];
     return true;
@@ -318,9 +345,13 @@ uint16_t ConfigSettings::calcSettingsRecSize() {
     + strlen(this->hostname) + 3
     + strlen(this->NTP.ntpServer) + 3
     + strlen(this->NTP.posixZone) + 3
+    + strlen(this->accentColor) + 3
     + 6  // ssdpbroadcast
-    + 6; // updateCheck
-    + 3;  // language
+    + 6  // updateCheck
+    + 6  // alexaHueEnabled
+    + 6  // autoInstallUpdate
+    + 6  // swShowGpio
+    + 3; // language
 }
 uint16_t ConfigSettings::calcNetRecSize() {
   return 4 // connType

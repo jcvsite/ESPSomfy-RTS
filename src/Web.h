@@ -1,3 +1,7 @@
+/**
+ * Web.h — WebServer wrapper and route/handler declarations.
+ */
+
 #include <WebServer.h>
 #include "Somfy.h"
 #ifndef webserver_h
@@ -20,10 +24,13 @@ public:
   void handleGetRooms(WebServer &server);
   void handleGetShades(WebServer &server);
   void handleGetGroups(WebServer &server);
+  void handleGetFixedCodes(WebServer &server);
   void handleShadeCommand(WebServer &server);
   void handleRepeatCommand(WebServer &server);
   void handleGroupCommand(WebServer &server);
   void handleTiltCommand(WebServer &server);
+  void handleFixedCodeCommand(WebServer &server);
+  void handleSaveFixedCode(WebServer &server);
   void handleDiscovery(WebServer &server);
   void handleNotFound(WebServer &server);
   void handleRoom(WebServer &server);
@@ -44,10 +51,19 @@ public:
   bool createAPIPinToken(const IPAddress ipAddress, const char *pin, char *token);
   bool createAPIPasswordToken(const IPAddress ipAddress, const char *username, const char *password, char *token);
   bool isAuthenticated(WebServer &server, bool cfg = false);
+  // After a successful LittleFS image write: remount and rewrite shades/fixedcodes from RAM.
+  // Requires a usable /index.html before restoring (refuse truncated UI images).
+  bool remountAndRestoreUserConfig();
+  // Mount-only check after Update(U_SPIFFS). Call before sending the HTTP response so the
+  // browser is not blocked on shade commits. Then call restoreUserConfigToFilesystem().
+  bool remountFilesystemAfterUpdate(bool requireUi = true);
+  void restoreUserConfigToFilesystem();
+  // After a failed/aborted LittleFS write: remount or reformat, then rewrite user data from RAM
+  // (UI may be missing — caller should not reboot until a good FS image is flashed).
+  bool recoverUserConfigAfterFsFailure();
+  // True when firmware was flashed with reboot deferred (package FW-then-FS). Cleared on success reboot or rollback.
+  bool pendingFwRollback = false;
+  void rollbackPendingFirmware();
 
-  //void chunkRoomsResponse(WebServer &server, const char *elem = nullptr);
-  //void chunkShadesResponse(WebServer &server, const char *elem = nullptr);
-  //void chunkGroupsResponse(WebServer &server, const char *elem = nullptr);
-  //void chunkGroupResponse(WebServer &server, SomfyGroup *, const char *prefix = nullptr);
 };
 #endif

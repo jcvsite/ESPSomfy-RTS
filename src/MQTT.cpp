@@ -1,3 +1,7 @@
+/**
+ * MQTT.cpp — MQTT client connect/publish and Home Assistant discovery payloads.
+ */
+
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -7,6 +11,8 @@
 #include "Somfy.h"
 #include "Network.h"
 #include "Utils.h"
+#include "FixedCode.h"
+#include "NoLog.h"
 
 WiFiClient tcpClient;
 PubSubClient mqttClient(tcpClient);
@@ -18,6 +24,7 @@ extern ConfigSettings settings;
 extern SomfyShadeController somfy;
 extern Network net;
 extern rebootDelay_t rebootDelay;
+extern FixedCodeController fixedCodes;
 
 const char* MQTTClass::makeTopic(const char* topic) {
   static char top[128];
@@ -85,11 +92,13 @@ void MQTTClass::receive(const char *topic, byte* payload, uint32_t length) {
       else if(strcmp(command, "myTiltPos") == 0) shade->setMyPosition(shade->myPos, val);
       else if(strcmp(command, "sunFlag") == 0) shade->sendCommand(val > 0 ? somfy_commands::SunFlag : somfy_commands::Flag);
       else if(strcmp(command, "position") == 0) {
-        shade->target = shade->currentPos = shade->transformPosition((float)val);
+        shade->calibratePosition(val, -1);
+        somfy.commit();
         shade->emitState();
       }
       else if(strcmp(command, "tiltPosition") == 0) {
-        shade->tiltTarget = shade->currentTiltPos = (float)val;
+        shade->calibratePosition(-1, val);
+        somfy.commit();
         shade->emitState();
       }
       else if(strcmp(command, "sunny") == 0) shade->sendSensorCommand(-1, val, shade->repeats);
@@ -107,6 +116,11 @@ void MQTTClass::receive(const char *topic, byte* payload, uint32_t length) {
       else if(strcmp(command, "sunFlag") == 0) group->sendCommand(val > 0 ? somfy_commands::Flag : somfy_commands::SunFlag);
       else if(strcmp(command, "sunny") == 0) group->sendSensorCommand(-1, val, group->repeats);
       else if(strcmp(command, "windy") == 0) group->sendSensorCommand(val, -1, group->repeats);
+    }
+  }
+  else if(strcmp(entityType, "switches") == 0) {
+    if(strcmp(command, "state") == 0) {
+      fixedCodes.command((uint8_t)atoi(entityId), value);
     }
   }
   esp_task_wdt_reset();
@@ -144,6 +158,7 @@ bool MQTTClass::connect() {
     this->subscribe("groups/+/sunFlag/set");
     this->subscribe("groups/+/sunny/set");
     this->subscribe("groups/+/windy/set");
+    this->subscribe("switches/+/state/set");
 
     mqttClient.setCallback(MQTTClass::receive);
     this->lastConnect = millis();
@@ -169,6 +184,7 @@ bool MQTTClass::disconnect() {
     this->unsubscribe("groups/+/sunFlag/set");
     this->unsubscribe("groups/+/sunny/set");
     this->unsubscribe("groups/+/windy/set");
+    this->unsubscribe("switches/+/state/set");
     mqttClient.disconnect();
   }
   return true;

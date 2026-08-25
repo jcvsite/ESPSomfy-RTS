@@ -1,3 +1,7 @@
+/**
+ * ConfigFile.h — Config file header/record helpers.
+ */
+
 #include <ArduinoJson.h>
 #include <LittleFS.h>
 #include "Somfy.h"
@@ -11,6 +15,10 @@
 #define CFG_TOK_NONE 0x00
 #define CFG_TOK_QUOTE '"'
 
+/** Append `\n###MARKER###\n` + optional LittleFS file bytes to a backup stream. */
+bool backupAppendSection(File &dst, const char *marker, const char *srcPath);
+/** Extract bytes after `###MARKER###` until the next `\n###` section (or EOF). */
+bool backupExtractSection(const char *backupPath, const char *marker, const char *outPath);
 
 struct config_header_t {
   uint8_t version = 1;
@@ -93,7 +101,7 @@ class ShadeConfigFile : public ConfigFile {
     bool loadFile(SomfyShadeController *somfy, const char *filename = "/shades.cfg");
     bool restoreFile(SomfyShadeController *somfy, const char *filename, restore_options_t &opts);
     void end();
-    //bool seekRecordById(uint8_t id);
+
     bool validate();
 };
 #endif

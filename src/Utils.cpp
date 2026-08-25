@@ -1,10 +1,13 @@
+/**
+ * Utils.cpp — Shared helpers (timestamps, formatting).
+ */
+
 #include <Arduino.h>
 #include <time.h>
 #include "Utils.h"
 
-
 /*********************************************************************
- * Timestamp class members
+ * Timestamp — wall-clock helpers used by schedules / UI status.
  ********************************************************************/
 unsigned long Timestamp::epoch() {
   struct tm tmNow;
@@ -128,4 +131,11 @@ int Timestamp::tzOffset() {
   time_t now;
   time(&now);
   return Timestamp::calcTZOffset(&now);
+}
+
+// Drop mbedtls error-string tables (~2KB) — TLS still works, messages become empty.
+extern "C" {
+  const char *mbedtls_high_level_strerr(int) { return ""; }
+  const char *mbedtls_low_level_strerr(int) { return ""; }
+  void mbedtls_strerror(int, char *buf, size_t len) { if(buf && len) buf[0] = 0; }
 }

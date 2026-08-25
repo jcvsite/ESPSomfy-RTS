@@ -1,3 +1,7 @@
+/**
+ * Recovery.h — LittleFS/NVS recovery helpers after failed updates.
+ */
+
 #ifndef RECOVERY_H
 #define RECOVERY_H
 

@@ -1,3 +1,7 @@
+/**
+ * Sockets.h — WebSocket emit helpers and room channels.
+ */
+
 #include <WebSocketsServer.h>
 #include "WResp.h"
 #ifndef sockets_h
@@ -21,7 +25,6 @@ class SocketEmitter {
     void delayInit(uint8_t num);
   public:
     JsonSockEvent json;
-    //ClientSocketEvent evt;
     room_t rooms[SOCK_MAX_ROOMS];
     uint8_t activeClients(uint8_t room);
     void initClients();

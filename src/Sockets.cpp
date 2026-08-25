@@ -1,3 +1,7 @@
+/**
+ * Sockets.cpp — WebSocket server: live shade/radio/events to the browser UI.
+ */
+
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <WebSocketsServer.h>
@@ -5,15 +9,17 @@
 #include "Sockets.h"
 #include "ConfigSettings.h"
 #include "Somfy.h"
+#include "FixedCode.h"
 #include "Network.h"
 #include "GitOTA.h"
+#include "NoLog.h"
 
 extern ConfigSettings settings;
 extern Network net;
 extern SomfyShadeController somfy;
+extern FixedCodeController fixedCodes;
 extern SocketEmitter sockEmit;
 extern GitUpdater git;
-
 
 WebSocketsServer sockServer = WebSocketsServer(8080);
 
@@ -53,24 +59,9 @@ uint8_t room_t::activeClients() {
   }
   return n;
 }
-/*********************************************************************
- * ClientSocketEvent class members
- ********************************************************************/
-/*
-void ClientSocketEvent::prepareMessage(const char *evt, const char *payload) {
-  if(strlen(payload) + 5 >= sizeof(this->msg)) Serial.printf("Socket buffer overflow %d > 2048\n", strlen(payload) + 5 + strlen(evt));
-    snprintf(this->msg, sizeof(this->msg), "42[%s,%s]", evt, payload);
-}
-void ClientSocketEvent::prepareMessage(const char *evt, JsonDocument &doc) {
-  memset(this->msg, 0x00, sizeof(this->msg));
-  snprintf(this->msg, sizeof(this->msg), "42[%s,", evt);
-  serializeJson(doc, &this->msg[strlen(this->msg)], sizeof(this->msg) - strlen(this->msg) - 2);
-  strcat(this->msg, "]");
-}
-*/
 
 /*********************************************************************
- * SocketEmitter class members
+ * SocketEmitter — browser WebSocket push for shade/radio live state.
  ********************************************************************/
 void SocketEmitter::startup() {
   
@@ -112,6 +103,7 @@ void SocketEmitter::initClients() {
         esp_task_wdt_reset();
         settings.emitSockets(num);
         somfy.emitState(num);
+        fixedCodes.emitAll(num);
         git.emitUpdateCheck(num);
         net.emitSockets(num);
         esp_task_wdt_reset();

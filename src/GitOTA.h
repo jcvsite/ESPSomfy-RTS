@@ -1,3 +1,7 @@
+/**
+ * GitOTA.h — Git OTA status and download API.
+ */
+
 #ifndef GITOTA_H
 #define GITOTA_H
 #include <Arduino.h>
@@ -6,6 +10,7 @@
 #include "ConfigSettings.h"
 #include "WResp.h"
 
+#define GITHUB_OWNER_REPO "jcvsite/ESPSomfy-RTS"
 #define GIT_MAX_RELEASES 5
 #define GIT_STATUS_READY 0
 #define GIT_STATUS_CHECK 1
@@ -14,6 +19,9 @@
 #define GIT_UPDATE_COMPLETE 4
 #define GIT_UPDATE_CANCELLING 5
 #define GIT_UPDATE_CANCELLED 6
+// Post-write LittleFS mount/content check failed -- see GitUpdater::validateFilesystem().
+#define ERR_FS_VALIDATION -44
+#define ERR_HTTP_NOT_FOUND -46
 
 class GitRelease {
   public:
@@ -48,7 +56,7 @@ class GitUpdater {
     bool cancelled = false;
     int16_t error = 0;
     char targetRelease[32];
-    char currentFile[64] = "";
+    char currentFile[80] = "";
     char baseUrl[128] = "";
     int partition = 0;
     void checkForUpdate();
@@ -56,10 +64,13 @@ class GitUpdater {
     bool endUpdate();
     int8_t downloadFile();
     void setFirmwareFile();
+    void setFirmwareAsset(const char *version);
+    void setFilesystemAsset(const char *version);
     void setCurrentRelease(GitRepo &repo);
     void loop();
     void toJSON(JsonResponse &json);
     bool recoverFilesystem();
+    bool validateFilesystem();
     int checkInternet();
     void emitUpdateCheck(uint8_t num=255);
     void emitDownloadProgress(size_t total, size_t loaded, const char *evt = "updateProgress");

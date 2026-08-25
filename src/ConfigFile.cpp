@@ -1,21 +1,64 @@
+/**
+ * ConfigFile.cpp — LittleFS shade/room/group/scene binary config read/write and backup format.
+ */
+
 #include <Arduino.h>
 #include <LittleFS.h>
 #include <Preferences.h>
 #include "ConfigFile.h"
 #include "Utils.h"
 #include "ConfigSettings.h"
+#include "NoLog.h"
 
 extern Preferences pref;
 
-#define SHADE_HDR_VER 25
+#define SHADE_HDR_VER 30
 #define SHADE_HDR_SIZE 76
-#define SHADE_REC_SIZE 276
-#define GROUP_REC_SIZE 200
+// Record sizes include fixed-width name fields (SOMFY_NAME_LEN). When name length
+// changes, bump these by (newNameLen - oldNameLen). Was name[21] → name[33] = +12.
+// v29: +6 for exposeAlexa bool.
+// v30: settings record adds autoInstallUpdate + swShowGpio.
+#define SHADE_REC_SIZE 338
+#define GROUP_REC_SIZE 212
 #define TRANS_REC_SIZE 78
-#define ROOM_REC_SIZE 29
+#define ROOM_REC_SIZE 41
 #define REPEATER_REC_SIZE 77
 
 extern ConfigSettings settings;
+
+bool backupAppendSection(File &dst, const char *marker, const char *srcPath) {
+  if(!marker || !marker[0]) return false;
+  dst.printf("\n###%s###\n", marker);
+  if(!srcPath || !LittleFS.exists(srcPath)) return true;
+  File src = LittleFS.open(srcPath, "r");
+  if(!src) return false;
+  while(src.available()) dst.write((uint8_t)src.read());
+  src.close();
+  return true;
+}
+
+bool backupExtractSection(const char *backupPath, const char *marker, const char *outPath) {
+  if(!backupPath || !marker || !outPath || !LittleFS.exists(backupPath)) return false;
+  File src = LittleFS.open(backupPath, "r");
+  if(!src) return false;
+  String content = src.readString();
+  src.close();
+  String tag = String("###") + marker + "###";
+  int m = content.indexOf(tag);
+  if(m < 0) return false;
+  int start = content.indexOf('\n', m);
+  if(start < 0) return false;
+  start++;
+  int end = content.indexOf("\n###", start);
+  if(end < 0) end = content.length();
+  // Trim a single trailing newline so empty sections stay empty files.
+  if(end > start && content[end - 1] == '\n') end--;
+  File dst = LittleFS.open(outPath, "w");
+  if(!dst) return false;
+  for(int i = start; i < end; i++) dst.write((uint8_t)content[i]);
+  dst.close();
+  return true;
+}
 
 bool ConfigFile::begin(const char* filename, bool readOnly) {
   this->file = LittleFS.open(filename, readOnly ? "r" : "w");
@@ -91,15 +134,6 @@ bool ConfigFile::readHeader() {
   Serial.printf("version:%u len:%u roomSize:%u roomRecs:%u shadeSize:%u shadeRecs:%u groupSize:%u groupRecs: %u pos:%d\n", this->header.version, this->header.length, this->header.roomRecordSize, this->header.roomRecords, this->header.shadeRecordSize, this->header.shadeRecords, this->header.groupRecordSize, this->header.groupRecords, this->file.position());
   return true;
 }
-/*
-bool ConfigFile::seekRecordByIndex(uint16_t ndx) {
-  if(!this->file) {
-    return false;
-  }
-  if(((this->header.recordSize * ndx) + this->header.length) > this->file.size()) return false;
-  return true;
-}
-*/
 bool ConfigFile::readString(char *buff, size_t len) {
   if(!this->file) return false;
   memset(buff, 0x00, len);
@@ -290,25 +324,6 @@ bool ConfigFile::readBool(const bool defVal) {
   }
   return defVal;
 }
-/*
-bool ShadeConfigFile::seekRecordById(uint8_t id) {
-  if(this->isOpen()) return false;
-  this->file.seek(this->header.length, SeekSet);  // Start at the beginning of the file after the header.
-  uint8_t i = 0;
-  while(i < SOMFY_MAX_SHADES) {
-    uint32_t pos = this->file.position();
-    uint8_t len = this->readUInt8(this->header.recordSize);
-    uint8_t cid = this->readUInt8(255);
-    if(cid == id) {
-      this->file.seek(pos, SeekSet);
-      return true;
-    }
-    pos += len;
-    this->file.seek(pos, SeekSet);
-  }
-  return false;
-}
-*/
 bool ShadeConfigFile::begin(bool readOnly) { return this->begin("/shades.cfg", readOnly); }
 bool ShadeConfigFile::begin(const char *filename, bool readOnly) { return ConfigFile::begin(filename, readOnly); }
 void ShadeConfigFile::end() { ConfigFile::end(); }
@@ -393,27 +408,12 @@ bool ShadeConfigFile::validate() {
     Serial.println(this->header.shadeRecordSize);
     return false;
   }
-  /*
-  if(this->header.shadeRecords != SOMFY_MAX_SHADES) {
-    Serial.print("Invalid Shade Record Count:");
-    Serial.println(this->header.shadeRecords);
-    return false;
-  }
-  */
   if(this->header.version > 10) {
     if(this->header.groupRecordSize < 100) {
       Serial.print("Invalid Group Record Size:");
       Serial.println(this->header.groupRecordSize);
       return false;
     }
-    /*
-    if(this->header.groupRecords != SOMFY_MAX_GROUPS) {
-      Serial.print("Invalid Group Record Count:");
-      Serial.println(this->header.groupRecords);
-      return false;
-      
-    }
-    */
   }
   if(this->file.position() != this->header.length) {
     Serial.printf("File not positioned at %u end of header: %d\n", this->header.length, this->file.position());
@@ -436,6 +436,9 @@ bool ShadeConfigFile::validate() {
     Serial.printf("File size is not correct should be %d and got %d\n", fsize, this->file.size());
   }
   // Next check to see if the records match the header length.
+  // If a firmware bump widened fixed name fields but an intermediate build
+  // wrote the old sizes into the header, repair when the measured length
+  // matches the current compile-time record size.
   uint8_t recs = 0;
   uint32_t startPos = this->file.position();
   if(this->header.version >= 19) {
@@ -445,9 +448,15 @@ bool ShadeConfigFile::validate() {
         Serial.printf("Failed to find the room record end %d\n", recs);
         return false;
       }
-      if(this->file.position() - pos != this->header.roomRecordSize) {
-        Serial.printf("Room record length is %d and should be %d\n", this->file.position() - pos, this->header.roomRecordSize);
-        return false;
+      uint32_t actual = this->file.position() - pos;
+      if(actual != this->header.roomRecordSize) {
+        if(actual == ROOM_REC_SIZE) {
+          Serial.printf("Repairing roomRecordSize %u -> %u\n", this->header.roomRecordSize, actual);
+          this->header.roomRecordSize = actual;
+        } else {
+          Serial.printf("Room record length is %d and should be %d\n", actual, this->header.roomRecordSize);
+          return false;
+        }
       }
       recs++;
     }
@@ -459,9 +468,15 @@ bool ShadeConfigFile::validate() {
       Serial.printf("Failed to find the shade record end %d\n", recs);
       return false;
     }
-    if(this->file.position() - pos != this->header.shadeRecordSize) {
-      Serial.printf("Shade record length is %d and should be %d\n", this->file.position() - pos, this->header.shadeRecordSize);
-      return false;
+    uint32_t actual = this->file.position() - pos;
+    if(actual != this->header.shadeRecordSize) {
+      if(actual == SHADE_REC_SIZE) {
+        Serial.printf("Repairing shadeRecordSize %u -> %u\n", this->header.shadeRecordSize, actual);
+        this->header.shadeRecordSize = actual;
+      } else {
+        Serial.printf("Shade record length is %d and should be %d\n", actual, this->header.shadeRecordSize);
+        return false;
+      }
     }
     recs++;
   }
@@ -474,9 +489,15 @@ bool ShadeConfigFile::validate() {
         return false;
       }
       recs++;
-      if(this->file.position() - pos != this->header.groupRecordSize) {
-        Serial.printf("Group record length is %d and should be %d\n", this->file.position() - pos, this->header.groupRecordSize);
-        return false;
+      uint32_t actual = this->file.position() - pos;
+      if(actual != this->header.groupRecordSize) {
+        if(actual == GROUP_REC_SIZE) {
+          Serial.printf("Repairing groupRecordSize %u -> %u\n", this->header.groupRecordSize, actual);
+          this->header.groupRecordSize = actual;
+        } else {
+          Serial.printf("Group record length is %d and should be %d\n", actual, this->header.groupRecordSize);
+          return false;
+        }
       }
     }
   }
@@ -527,30 +548,38 @@ bool ShadeConfigFile::restoreFile(SomfyShadeController *s, const char *filename,
   if(opts.shades) {
     Serial.println("Restoring Rooms...");
     for(uint8_t i = 0; i < this->header.roomRecords; i++) {
-      this->readRoomRecord(&s->rooms[i]);
-      if(i > 0) Serial.print(",");
-      Serial.print(s->rooms[i].roomId);
+      if(i < SOMFY_MAX_ROOMS) {
+        this->readRoomRecord(&s->rooms[i]);
+        if(i > 0) Serial.print(",");
+        Serial.print(s->rooms[i].roomId);
+      }
+      else this->seekChar(CFG_REC_END);
+    }
+    for(uint8_t i = this->header.roomRecords; i < SOMFY_MAX_ROOMS; i++) {
+      s->rooms[i].clear();
     }
     Serial.println("Restoring Shades...");
     // We should be valid so start reading.
     for(uint8_t i = 0; i < this->header.shadeRecords; i++) {
-      this->readShadeRecord(&s->shades[i]);
-      if(i > 0) Serial.print(",");
-      Serial.print(s->shades[i].getShadeId());
+      if(i < SOMFY_MAX_SHADES) {
+        this->readShadeRecord(&s->shades[i]);
+        if(i > 0) Serial.print(",");
+        Serial.print(s->shades[i].getShadeId());
+      }
+      else this->seekChar(CFG_REC_END);
     }
     Serial.println("");
-    if(this->header.shadeRecords < SOMFY_MAX_SHADES) {
-      uint8_t ndx = this->header.shadeRecords;
-      // Clear out any positions that are not in the shade file.
-      while(ndx < SOMFY_MAX_SHADES) {
-        ((SomfyShade *)&s->shades[ndx++])->clear();
-      }
+    for(uint8_t i = this->header.shadeRecords; i < SOMFY_MAX_SHADES; i++) {
+      s->shades[i].clear();
     }
     Serial.println("Restoring Groups...");
     for(uint8_t i = 0; i < this->header.groupRecords; i++) {
-      if(i > 0) Serial.print(",");
-      Serial.print(s->groups[i].getGroupId());
-      this->readGroupRecord(&s->groups[i]);
+      if(i < SOMFY_MAX_GROUPS) {
+        if(i > 0) Serial.print(",");
+        Serial.print(s->groups[i].getGroupId());
+        this->readGroupRecord(&s->groups[i]);
+      }
+      else this->seekChar(CFG_REC_END);
     }
     Serial.println("");
     if(this->header.groupRecords < SOMFY_MAX_GROUPS) {
@@ -719,15 +748,19 @@ bool ShadeConfigFile::readSettingsRecord() {
     if(this->header.version >= 26) {
       this->readVarString(settings.accentColor, sizeof(settings.accentColor));
     } else {
-      strncpy(settings.accentColor, "#1a5fb4", sizeof(settings.accentColor));
+      strncpy(settings.accentColor, "#009BFF", sizeof(settings.accentColor));
     }
     settings.ssdpBroadcast = this->readBool(false);
-    if(this->header.version >= 20) settings.checkForUpdate = this->readBool(true);
-    if(this->header.version >= 25) {
-      settings.language = this->readUInt8(0);
-    } else {
-      settings.language = 0; // Anglais par défaut pour les versions antérieures
+    if(this->header.version >= 20) settings.checkForUpdate = this->readBool(false);
+    if(this->header.version >= 29) settings.alexaHueEnabled = this->readBool(false);
+    if(this->header.version >= 30) {
+      settings.autoInstallUpdate = this->readBool(false);
+      settings.swShowGpio = this->readBool(false);
     }
+    if(this->header.version >= 25) {
+      this->readUInt8(0); // skip legacy language field
+    }
+    settings.language = 0; // English-only UI
     if(this->file.position() != startPos + this->header.settingsRecordSize) {
       Serial.println("Reading to end of settings record");
       this->seekChar(CFG_REC_END);
@@ -821,6 +854,7 @@ bool ShadeConfigFile::readShadeRecord(SomfyShade *shade) {
     rem->setRemoteAddress(this->readUInt32(0));
     if(rem->getRemoteAddress() != 0) rem->lastRollingCode = pref.getUShort(rem->getRemotePrefId(), 0);
     if(this->header.version < 5 && j == 4) break; // Prior to version 5 we only supported 5 linked remotes.
+    if(this->header.version < 27 && j == 6) break; // Prior to version 27 we only supported 7 linked remotes.
   }
   shade->lastRollingCode = this->readUInt16(0);
   if(this->header.version > 7) shade->flags = this->readUInt8(0);
@@ -877,6 +911,7 @@ bool ShadeConfigFile::readShadeRecord(SomfyShade *shade) {
   if(shade->proto == radio_proto::GP_Remote)
     pinMode(shade->gpioMy, OUTPUT);
   if(this->header.version >= 19) shade->roomId = this->readUInt8(0);
+  if(this->header.version >= 29) shade->exposeAlexa = this->readBool(false);
   if(this->file.position() != startPos + this->header.shadeRecordSize) {
     Serial.println("Reading to end of shade record");
     this->seekChar(CFG_REC_END);
@@ -895,30 +930,25 @@ bool ShadeConfigFile::loadFile(SomfyShadeController *s, const char *filename) {
     if(opened) this->end();
     return false;
   }
-  for(uint8_t i = 0; i < this->header.roomRecords;i++) {
-    this->readRoomRecord(&s->rooms[i]);
+  for(uint8_t i = 0; i < this->header.roomRecords; i++) {
+    if(i < SOMFY_MAX_ROOMS) this->readRoomRecord(&s->rooms[i]);
+    else this->seekChar(CFG_REC_END);
   }
-  if(this->header.roomRecords < SOMFY_MAX_ROOMS) {
-    uint8_t ndx = this->header.roomRecords;
-    // Clear out any positions that are not in the shade file.
-    while(ndx < SOMFY_MAX_ROOMS) {
-      ((SomfyRoom *)&s->rooms[ndx++])->clear();
-    }
+  for(uint8_t i = this->header.roomRecords; i < SOMFY_MAX_ROOMS; i++) {
+    s->rooms[i].clear();
   }
   
   // We should be valid so start reading.
   for(uint8_t i = 0; i < this->header.shadeRecords; i++) {
-    this->readShadeRecord(&s->shades[i]);
+    if(i < SOMFY_MAX_SHADES) this->readShadeRecord(&s->shades[i]);
+    else this->seekChar(CFG_REC_END);
   }
-  if(this->header.shadeRecords < SOMFY_MAX_SHADES) {
-    uint8_t ndx = this->header.shadeRecords;
-    // Clear out any positions that are not in the shade file.
-    while(ndx < SOMFY_MAX_SHADES) {
-      ((SomfyShade *)&s->shades[ndx++])->clear();
-    }
+  for(uint8_t i = this->header.shadeRecords; i < SOMFY_MAX_SHADES; i++) {
+    s->shades[i].clear();
   }
   for(uint8_t i = 0; i < this->header.groupRecords; i++) {
-    this->readGroupRecord(&s->groups[i]);
+    if(i < SOMFY_MAX_GROUPS) this->readGroupRecord(&s->groups[i]);
+    else this->seekChar(CFG_REC_END);
   }
   if(this->header.groupRecords < SOMFY_MAX_GROUPS) {
     uint8_t ndx = this->header.groupRecords;
@@ -1013,7 +1043,8 @@ bool ShadeConfigFile::writeShadeRecord(SomfyShade *shade) {
   this->writeUInt8(shade->gpioDown);
   this->writeUInt8(shade->gpioMy);
   this->writeUInt8(shade->gpioFlags);
-  this->writeUInt8(shade->roomId, CFG_REC_END);
+  this->writeUInt8(shade->roomId);
+  this->writeBool(shade->exposeAlexa, CFG_REC_END);
   return true;  
 }
 bool ShadeConfigFile::writeSettingsRecord() {
@@ -1024,6 +1055,9 @@ bool ShadeConfigFile::writeSettingsRecord() {
   this->writeVarString(settings.accentColor);
   this->writeBool(settings.ssdpBroadcast);
   this->writeBool(settings.checkForUpdate);
+  this->writeBool(settings.alexaHueEnabled);
+  this->writeBool(settings.autoInstallUpdate);
+  this->writeBool(settings.swShowGpio);
   this->writeUInt8(settings.language,CFG_REC_END);
   return true;
 }

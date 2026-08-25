@@ -1,7 +1,12 @@
+/**
+ * Network.cpp — Wi-Fi/Ethernet, SoftAP fallback, mDNS/SSDP hooks, and connection state.
+ */
+
 #include <ETH.h>
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include <esp_task_wdt.h>
+#include <esp_wifi.h>
 #include "ConfigSettings.h"
 #include "Network.h"
 #include "Web.h"
@@ -9,6 +14,9 @@
 #include "Utils.h"
 #include "SSDP.h"
 #include "MQTT.h"
+#include "Mesh.h"
+#include "AlexaHue.h"
+#include "NoLog.h"
 
 extern ConfigSettings settings;
 extern Web webServer;
@@ -17,6 +25,7 @@ extern MQTTClass mqtt;
 extern rebootDelay_t rebootDelay;
 extern Network net;
 extern SomfyShadeController somfy;
+extern MeshController mesh;
 
 static unsigned long _lastHeapEmit = 0;
 
@@ -80,12 +89,37 @@ void Network::loop() {
   //       the connection process for the WiFi connection.
   //    c. SoftAP: This condition retains the Soft AP because no other connection method is available.
   conn_types_t ctype = this->preferredConnType();
-  this->connect(ctype); // Connection timeout handled in connect function as well as the opening of the Soft AP if needed.
+
+  // Keep the setup hotspot while a Repeater has not joined the Router (or role is unset).
+  // Do not close it on idle — otherwise a bad Wi‑Fi password / failed mesh login leaves no web UI.
+  if(this->softAPOpened && !this->openingSoftAP && settings.WIFI.ssid[0] != '\0' && !mesh.keepSetupHotspot()) {
+    if(WiFi.softAPgetStationNum() > 0) {
+      this->softApIdleSince = 0; // pause timer while someone is configuring
+    }
+    else {
+      if(this->softApIdleSince == 0) this->softApIdleSince = millis();
+      if(millis() - this->softApIdleSince >= SOFTAP_SETUP_IDLE_MS) {
+        Serial.println(F("SoftAP idle 5 min — closing hotspot; retrying saved SSID every 15s"));
+        this->closeSoftAPForScan();
+      }
+    }
+  }
+
+  this->connect(ctype); // STA cadence + SoftAP grace handled in connect().
+  // On Wi‑Fi but not joined to the Router: raise SoftAP so 192.168.4.1 still works.
+  if(mesh.keepSetupHotspot() && this->connected() && !this->softAPOpened && !this->openingSoftAP && !this->softApDisabled)
+    this->openSoftAP();
+  // Mesh join succeeded: drop the setup hotspot if nobody is using it.
+  if(this->softAPOpened && !this->openingSoftAP && !mesh.keepSetupHotspot() && WiFi.softAPgetStationNum() == 0) {
+    Serial.println(F("Mesh joined — closing setup SoftAP"));
+    this->softApDisabled = true;
+    this->closeSoftAPForScan();
+  }
   if(this->connecting()) return; // If we are currently attempting to connect to something then we need to bail here.
   if(_apScanning) {
     if(settings.WIFI.hidden ||                                    // This user has elected to use a hidden AP.
       (this->connected() && !settings.WIFI.roaming) ||            // We are already connected and should not be roaming.
-      (this->softAPOpened && WiFi.softAPgetStationNum() != 0) ||  // The Soft AP is open and a user is connected.
+      this->softAPOpened || this->openingSoftAP ||               // SoftAP open: never STA-connect from a scan.
       (ctype != conn_types_t::wifi)) {                            // The Ethernet link is up so we should ignore this scan.
       Serial.println("Cancelling WiFi STA Scan...");
       _apScanning = false;
@@ -113,22 +147,22 @@ void Network::loop() {
     }
   }
   if(!this->connecting() && !settings.WIFI.hidden) {
-    if((this->softAPOpened && WiFi.softAPgetStationNum() == 0) ||
-      (!this->connected() && ctype == conn_types_t::wifi)) {
-      // If the Soft AP is opened and there are no clients connected then we need to scan for an AP.  If
-      // our target exists we will exit out of the Soft AP and start that connection.  We are also
-      // going to continuously scan when there is no connection and our preferred connection is wifi.
-      if(ctype == conn_types_t::wifi) {
-        // Scan for an AP but only if we are not already scanning.
-        if(!_apScanning && WiFi.scanNetworks(true, false, true, 300, 0, settings.WIFI.ssid) == -1) {
-          _apScanning = true;
-        }
+    // Do not STA-scan while SoftAP is open (tears down hotspot on ESP32).
+    // While SoftAP is down, scan at most every 15 s (connect() also kicks WiFi.begin on that cadence).
+    const bool softApDue = (!this->connected() && !this->softApDisabled &&
+      settings.WIFI.ssid[0] != '\0' &&
+      millis() > this->disconnectTime + SOFTAP_STA_GRACE_MS);
+    if(!this->softAPOpened && !this->openingSoftAP && !this->connected() &&
+        ctype == conn_types_t::wifi && (this->softApDisabled || !softApDue)) {
+      if(!_apScanning && (this->lastWifiScan == 0 || millis() - this->lastWifiScan >= SSID_RETRY_INTERVAL) &&
+          WiFi.scanNetworks(true, false, true, 300, 0, settings.WIFI.ssid) == -1) {
+        _apScanning = true;
+        this->lastWifiScan = millis();
       }
     }
     else if(this->connected() && ctype == conn_types_t::wifi && settings.WIFI.roaming) {
       // Periodically look for a roaming AP.
       if(millis() > SSID_SCAN_INTERVAL + this->lastWifiScan) {
-        //Serial.println("Started scan for access points");
         if(!_apScanning && WiFi.scanNetworks(true, false, true, 300, 0, settings.WIFI.ssid) == -1) {
           _apScanning = true;
           this->lastWifiScan = millis();
@@ -147,12 +181,12 @@ void Network::loop() {
   }
   
   sockEmit.loop();
-  mqtt.loop();
-  if(settings.ssdpBroadcast && this->connected()) {
+  if(!mesh.isRepeater()) mqtt.loop();
+  if(!mesh.isRepeater() && settings.ssdpBroadcast && this->connected()) {
     if(!SSDP.isStarted) SSDP.begin();
     if(SSDP.isStarted) SSDP.loop();
   }
-  else if(!settings.ssdpBroadcast && SSDP.isStarted) SSDP.end();
+  else if((mesh.isRepeater() || !settings.ssdpBroadcast) && SSDP.isStarted) SSDP.end();
 }
 bool Network::changeAP(const uint8_t *bssid, const int32_t channel) {
   esp_task_wdt_reset(); // Make sure we do not reboot here.
@@ -230,9 +264,18 @@ void Network::setConnected(conn_types_t connType) {
   Serial.println(F("Net: Connected")); // Version courte
 
   if(this->connType == conn_types_t::wifi) {
-    if(this->softAPOpened && WiFi.softAPgetStationNum() == 0) {
-      WiFi.softAPdisconnect(true);
-      WiFi.mode(WIFI_STA);
+    // Paired Router/Repeater: drop SoftAP after STA. Unpaired Repeater keeps AP+STA
+    // so 192.168.4.1 still works if Wi‑Fi joined but mesh login/join failed.
+    if(!mesh.keepSetupHotspot()) {
+      this->softApDisabled = true;
+      this->softApIdleSince = 0;
+      if(this->softAPOpened && WiFi.softAPgetStationNum() == 0) {
+        WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_STA);
+      }
+    }
+    else {
+      this->softApDisabled = false;
     }
     this->_connecting = false;
     strlcpy(this->ssid, WiFi.SSID().c_str(), sizeof(this->ssid));
@@ -281,14 +324,15 @@ void Network::setConnected(conn_types_t connType) {
   SSDP.setHTTPPort(80);
   SSDP.setSchemaURL(0, "upnp.xml");
   SSDP.setChipId(0, this->getChipId());
-  SSDP.setDeviceType(0, "urn:schemas-xkain-org:device:Somfy:1"); // Raccourci
+  SSDP.setDeviceType(0, "urn:schemas-rstrouse-org:device:ESPSomfyRTS:1");
   SSDP.setName(0, settings.hostname);
-  SSDP.setModelName(0, "SomfyRTS"); // Raccourci
+  SSDP.setModelName(0, "ESPSomfy RTS");
 
   SSDP.setModelNumber(0, (strlen(settings.chipModel) == 0) ? "ESP32" : settings.chipModel);
 
-  SSDP.setModelURL(0, "https://git.io/xkain"); // URL courte
-  SSDP.setManufacturer(0, "xkain");
+  SSDP.setModelURL(0, "https://github.com/jcvsite/ESPSomfy-RTS");
+  SSDP.setManufacturer(0, "ESPSomfy");
+  SSDP.setManufacturerURL(0, "https://github.com/jcvsite/ESPSomfy-RTS");
   SSDP.setURL(0, "/");
   SSDP.setActive(0, true);
 
@@ -296,15 +340,17 @@ void Network::setConnected(conn_types_t connType) {
 
   if(MDNS.begin(settings.hostname)) {
     MDNS.addService("http", "tcp", 80);
-    MDNS.addService("espsomfy_rts", "tcp", 8080);
-
-    MDNS.addServiceTxt("espsomfy_rts", "tcp", "serverId", (const char*)settings.serverId);
-    MDNS.addServiceTxt("espsomfy_rts", "tcp", "model", "ESPSomfyRTS");
-    MDNS.addServiceTxt("espsomfy_rts", "tcp", "version", (const char*)settings.fwVersion.name);
+    if(!mesh.isRepeater()) {
+      MDNS.addService("espsomfy_rts", "tcp", 8080);
+      MDNS.addServiceTxt("espsomfy_rts", "tcp", "serverId", (const char*)settings.serverId);
+      MDNS.addServiceTxt("espsomfy_rts", "tcp", "model", "ESPSomfyRTS");
+      MDNS.addServiceTxt("espsomfy_rts", "tcp", "version", (const char*)settings.fwVersion.name);
+    }
   }
 
-  if(settings.ssdpBroadcast) SSDP.begin();
+  if(!mesh.isRepeater() && settings.ssdpBroadcast) SSDP.begin();
   else if(SSDP.isStarted) SSDP.end();
+  alexaHue.applySettings();
 
   esp_task_wdt_reset();
   this->emitSockets();
@@ -466,19 +512,27 @@ bool Network::connect(conn_types_t ctype) {
     // Here we need to call the connect to ethernet.
     this->connectWired();
   }
-  else if(ctype == conn_types_t::ap || (!this->connected() && millis() > this->disconnectTime + CONNECT_TIMEOUT)) {
-    if(!this->softAPOpened && !this->openingSoftAP) {
-      this->disconnectTime = millis();
+  else if(ctype == conn_types_t::ap) {
+    // No saved SSID — SoftAP for first-time setup (short boot settle only).
+    if(!this->softAPOpened && !this->openingSoftAP && !this->softApDisabled &&
+        millis() > this->disconnectTime + SOFTAP_BOOT_DELAY_MS) {
       this->openSoftAP();
     }
-    else if(this->softAPOpened && !this->openingSoftAP && 
-      (ctype == conn_types_t::wifi && this->connType != conn_types_t::wifi && settings.WIFI.hidden)) {
-      // When thge softAP is open then we need to try to connect to wifi repeatedly if the user connects to a hidden SSID.
-      this->connectWiFi();
-    }
   }
-  else if((ctype == conn_types_t::wifi && this->connType != conn_types_t::wifi && settings.WIFI.hidden)) {
-    this->connectWiFi();
+  else if(ctype == conn_types_t::wifi && !this->connected()) {
+    const uint32_t grace = mesh.keepSetupHotspot() ? SOFTAP_SETUP_GRACE_MS : SOFTAP_STA_GRACE_MS;
+    const bool graceDone = millis() > this->disconnectTime + grace;
+    if(graceDone && !this->softAPOpened && !this->openingSoftAP && !this->softApDisabled) {
+      Serial.printf("STA failed — opening SoftAP (%s)\n", mesh.keepSetupHotspot() ? "setup/recovery" : "3 min grace");
+      this->openSoftAP();
+    }
+    else if(!this->softAPOpened && !this->openingSoftAP) {
+      // Continuous STA reconnect every 15 s (boot + after SoftAP closes).
+      if(this->lastStaRetry == 0 || millis() - this->lastStaRetry >= SSID_RETRY_INTERVAL) {
+        this->lastStaRetry = millis();
+        this->connectWiFi();
+      }
+    }
   }
   
   return true;
@@ -513,15 +567,51 @@ bool Network::getStrongestAP(const char *ssid, uint8_t *bssid, int32_t *channel)
   return chan > 0;
 }
 bool Network::openSoftAP() {
-  if(this->softAPOpened || this->openingSoftAP) return true;
-  if(this->connected()) WiFi.disconnect(false);
+  if(this->softApDisabled || this->softAPOpened || this->openingSoftAP) return false;
   this->openingSoftAP = true;
   Serial.println();
   Serial.println("Turning the HotSpot On");
-  esp_task_wdt_reset(); // Make sure we do not reboot here.
-  WiFi.softAP(strlen(settings.hostname) > 0 ? settings.hostname : "ESPSomfy RTS", "");
+  esp_task_wdt_reset();
+  const bool keepSta = this->connected() && mesh.keepSetupHotspot();
+  if(!keepSta) {
+    // Abort STA so SoftAP is not torn down by a late scan (setup / failed Wi‑Fi).
+    _apScanning = false;
+    esp_wifi_scan_stop();
+    WiFi.scanDelete();
+    WiFi.disconnect(true, true);
+    for(uint8_t i = 0; i < 40 && WiFi.scanComplete() == WIFI_SCAN_RUNNING; i++) {
+      delay(50);
+      esp_task_wdt_reset();
+    }
+    delay(150);
+  }
+  const char *apName = strlen(settings.hostname) > 0 ? settings.hostname : "ESPSomfyRTS";
+  WiFi.softAP(apName, "");
+  Serial.printf("SoftAP SSID: [%s]  (open)  http://192.168.4.1%s\n", apName, keepSta ? " + STA" : "");
   delay(200);
   return true;
+}
+void Network::closeSoftAPForScan() {
+  // Do not set softApDisabled here — SoftAP may open again after another 3 min STA grace.
+  this->softApIdleSince = 0;
+  this->openingSoftAP = false;
+  _apScanning = false;
+  esp_wifi_scan_stop();
+  WiFi.scanDelete();
+  wifi_mode_t mode = WiFi.getMode();
+  if(this->softAPOpened || mode == WIFI_AP || mode == WIFI_AP_STA) {
+    WiFi.softAPdisconnect(true);
+  }
+  WiFi.mode(WIFI_STA);
+  this->softAPOpened = false;
+  this->disconnectTime = millis(); // new 3 min STA grace before SoftAP can reopen
+  this->lastStaRetry = 0;          // immediate reconnect attempt
+  this->lastWifiScan = 0;
+  this->clearConnecting();
+  if(settings.WIFI.ssid[0] != '\0') {
+    this->lastStaRetry = millis();
+    this->connectWiFi();
+  }
 }
 bool Network::connected() {
   if(this->connecting()) return false;
@@ -600,6 +690,8 @@ void Network::networkEvent(WiFiEvent_t event) {
       Serial.println(WiFi.softAPIP());
       net.openingSoftAP = false;
       net.softAPOpened = true;
+      // Begin 5‑minute idle countdown (paused while a client is connected).
+      net.softApIdleSince = millis();
       break;
     case ARDUINO_EVENT_WIFI_AP_STOP:
       if(!net.openingSoftAP) Serial.println(F("Access Point stopped"));

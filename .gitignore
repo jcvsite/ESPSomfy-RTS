@@ -1,19 +1,18 @@
-# --- Fichiers et dossiers spécifiques à PlatformIO ---
+# --- PlatformIO / build ---
 .pio/
 .pioenvs/
 .piolibdeps/
 .clang_complete
 .gcc-flags.json
 extdata/
-
-# --- Dossiers de build et fichiers de sortie ---
 build/
 .cache/
 *.bin
 *.elf
 *.map
+*.espsomfy
 
-# --- Fichiers d'environnement ---
+# --- Editors / local tools ---
 .vscode/
 .theia/
 .idea/
@@ -22,4 +21,20 @@ cmake-build-*/
 debug_custom.json
 esp32.svd
 debug.cfg
+.cursor/
 
+# --- Local / private (do not publish) ---
+backups/
+assets/
+*.backup
+.env
+.env.*
+*.pem
+*.key
+credentials*
+secrets*
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store

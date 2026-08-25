@@ -1,3 +1,7 @@
+/**
+ * Web.cpp — HTTP API, static UI serve, auth, Manual Update (firmware/LittleFS), and settings endpoints.
+ */
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <LittleFS.h>
@@ -14,6 +18,11 @@
 #include "MQTT.h"
 #include "GitOTA.h"
 #include "Network.h"
+#include "FixedCode.h"
+#include "Mesh.h"
+#include "Automation.h"
+#include "AlexaHue.h"
+#include "NoLog.h"
 
 extern ConfigSettings settings;
 extern SSDPClass SSDP;
@@ -23,6 +32,8 @@ extern Web webServer;
 extern MQTTClass mqtt;
 extern GitUpdater git;
 extern Network net;
+extern FixedCodeController fixedCodes;
+extern MeshController mesh;
 
 //#define WEB_MAX_RESPONSE 34768
 #define WEB_MAX_RESPONSE 4096
@@ -36,12 +47,10 @@ static const char _encoding_text[] = "text/plain";
 static const char _encoding_html[] = "text/html";
 static const char _encoding_json[] = "application/json";
 
-
 WebServer apiServer(8081);
 WebServer server(80);
 void Web::startup() {
   Serial.println("Launching web server...");
-
 
   //server.on("/json", HTTP_GET, []() {
     //Serial.print(">>> REQUETE /json RECUE DE L'IP : ");
@@ -82,8 +91,83 @@ void Web::handleDeserializationError(WebServer &server, DeserializationError &er
       break;
     }
 }
+bool Web::remountAndRestoreUserConfig() {
+  // Update(U_SPIFFS) replaces the whole filesystem image. Shade/fixed-code
+  // records live on that partition — rewrite them from the in-RAM controller
+  // state so "Update application" does not wipe devices.
+  if(!this->remountFilesystemAfterUpdate(true)) return false;
+  this->restoreUserConfigToFilesystem();
+  this->pendingFwRollback = false;
+  return true;
+}
+bool Web::remountFilesystemAfterUpdate(bool requireUi) {
+  git.lockFS = false;
+  esp_task_wdt_reset();
+  LittleFS.end();
+  if(!LittleFS.begin(false)) {
+    Serial.println(F("LittleFS remount failed after application update"));
+    return false;
+  }
+  if(!requireUi) return true;
+  const char *indexPath = LittleFS.exists("/index.html") ? "/index.html"
+                        : (LittleFS.exists("/index.html.gz") ? "/index.html.gz" : nullptr);
+  if(!indexPath) {
+    Serial.println(F("LittleFS remount: /index.html(.gz) missing"));
+    return false;
+  }
+  File f = LittleFS.open(indexPath, "r");
+  bool ok = f && f.size() > 0;
+  if(f) f.close();
+  if(!ok) {
+    Serial.println(F("LittleFS remount: index empty"));
+    return false;
+  }
+  return true;
+}
+void Web::restoreUserConfigToFilesystem() {
+  esp_task_wdt_reset();
+  somfy.commit();
+  esp_task_wdt_reset();
+  fixedCodes.commit();
+  esp_task_wdt_reset();
+  mesh.save();
+  esp_task_wdt_reset();
+  if(automation) automation->save();
+  settings.getAppVersion();
+  Serial.println(F("Restored shades/fixedcodes/mesh/automation onto new filesystem"));
+}
+bool Web::recoverUserConfigAfterFsFailure() {
+  // Mid-write abort/timeout already erased the old LittleFS image. Bring the
+  // partition back and rewrite shade data from RAM so a later reboot does not
+  // boot into an empty config. Prefer remounting whatever is there; only
+  // format when the partition is completely unmountable (true mid-erase case).
+  git.lockFS = false;
+  esp_task_wdt_reset();
+  LittleFS.end();
+  bool mounted = LittleFS.begin(false);
+  if(!mounted) {
+    Serial.println(F("LittleFS damaged after failed update - reformatting to restore shade data"));
+    if(!LittleFS.begin(true)) {
+      Serial.println(F("LittleFS format failed during FS recovery"));
+      return false;
+    }
+  }
+  this->restoreUserConfigToFilesystem();
+  return true;
+}
+void Web::rollbackPendingFirmware() {
+  if(!this->pendingFwRollback) return;
+  this->pendingFwRollback = false;
+  if(Update.canRollBack()) {
+    Serial.println(F("Rolling back firmware boot slot after filesystem update failure"));
+    if(!Update.rollBack())
+      Serial.println(F("Firmware rollback failed"));
+  }
+  else {
+    Serial.println(F("No bootable previous firmware slot for rollback"));
+  }
+}
 bool Web::isAuthenticated(WebServer &server, bool cfg) {
-  Serial.println("Checking authentication");
   if(settings.Security.type == security_types::None) return true;
   else if(!cfg && (settings.Security.permissions & static_cast<uint8_t>(security_permissions::ConfigOnly)) == 0x01) return true;
   else if(server.hasHeader("apikey")) {
@@ -144,27 +228,16 @@ void Web::handleLang(WebServer &server) {
     webServer.sendCORSHeaders(server);
     if (server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
 
-    String filename = "/locale/en.json.gz"; // Par défaut en .gz
-
-    // On définit le fichier selon le réglage
-    if (settings.language == 0) filename = "/locale/en.json.gz";
-    else if (settings.language == 1) filename = "/locale/fr.json.gz";
-    else if (settings.language == 2) filename = "/locale/de.json.gz";
-    else if (settings.language == 3) filename = "/locale/es.json.gz";
+    // English-only UI
+    const char *filename = "/locale/en.json.gz";
+    settings.language = 0;
 
     if (LittleFS.exists(filename)) {
         File file = LittleFS.open(filename, "r");
-        
-        // --- MÉTHODE D'ENVOI MANUELLE (Identique à handleStreamFile) ---
         server.setContentLength(file.size());
         server.sendHeader("Content-Encoding", "gzip");
-        
-        // On envoie le Type MIME JSON
-        server.send(200, "application/json", ""); 
-        
-        // Envoi du binaire compressé
+        server.send(200, "application/json", "");
         server.client().write(file);
-        
         file.close();
     } else {
         Serial.print("Lang file not found: ");
@@ -178,21 +251,10 @@ void Web::handleSetLang(WebServer &server) {
       server.send(200, "OK");
       return;
     }
-
-    if(!server.hasArg("lang")) {
-      server.send(400, _encoding_json, "{\"error\":\"missing lang\"}");
-      return;
-    }
-
-    String lang = server.arg("lang");
-
-    if(lang == "en") settings.language = 0;
-    else if(lang == "fr") settings.language = 1;
-    else if(lang == "de") settings.language = 2;
-    else if(lang == "es") settings.language = 3;
-
+    // English-only: ignore requested language and keep en
+    settings.language = 0;
     settings.save();
-    server.send(200, _encoding_json, "{\"status\":\"ok\"}");
+    server.send(200, _encoding_json, "{\"status\":\"ok\",\"lang\":\"en\"}");
 }
 void Web::handleLogout(WebServer &server) {
   Serial.println("Logging out of webserver");
@@ -325,6 +387,16 @@ void Web::handleController(WebServer &server) {
     resp.addElem("maxGroups", (uint8_t)SOMFY_MAX_GROUPS);
     resp.addElem("maxGroupedShades", (uint8_t)SOMFY_MAX_GROUPED_SHADES);
     resp.addElem("maxLinkedRemotes", (uint8_t)SOMFY_MAX_LINKED_REMOTES);
+    resp.addElem("maxFixedCodes", (uint8_t)FIXED_MAX_SWITCHES);
+    resp.beginObject("libs");
+    resp.addElem("cc1101", LIB_CC1101_VER);
+    resp.addElem("arduinojson", LIB_ARDUINOJSON_VER);
+    resp.addElem("pubsub", LIB_PUBSUB_VER);
+    resp.addElem("asyncwebserver", LIB_ASYNCWS_VER);
+    resp.addElem("asynctcp", LIB_ASYNCTCP_VER);
+    resp.addElem("websockets", LIB_WEBSOCKETS_VER);
+    resp.addElem("platform", LIB_PIO_PLATFORM);
+    resp.endObject();
     resp.addElem("startingAddress", (uint32_t)somfy.startingAddress);
     resp.beginObject("transceiver");
     somfy.transceiver.toJSON(resp);
@@ -340,6 +412,9 @@ void Web::handleController(WebServer &server) {
     resp.endArray();
     resp.beginArray("groups");
     somfy.toJSONGroups(resp);
+    resp.endArray();
+    resp.beginArray("fixedCodes");
+    fixedCodes.toJSON(resp);
     resp.endArray();
     resp.beginArray("repeaters");
     somfy.toJSONRepeaters(resp);
@@ -380,6 +455,8 @@ void Web::handleLoginContext(WebServer &server) {
     resp.addElem("fsTotal", (uint32_t)(total / 1024)); // En Ko
     resp.addElem("fsUsed", (uint32_t)(used / 1024));   // En Ko
     resp.addElem("flashSpeed", (uint32_t)(ESP.getFlashChipSpeed() / 1000000)); // En MHz
+    resp.addElem("meshRole", (uint8_t)mesh.role);
+    resp.addElem("connected", net.connected());
     resp.endObject();
     resp.endResponse();
 }
@@ -446,6 +523,7 @@ void Web::handleGetGroups(WebServer &server) {
 void Web::handleShadeCommand(WebServer& server) {
   webServer.sendCORSHeaders(server);
   if (server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
+  if(mesh.isRepeater()) { server.send(403, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Repeater\"}")); return; }
   HTTPMethod method = server.method();
   uint8_t shadeId = 255;
   uint8_t target = 255;
@@ -488,15 +566,18 @@ void Web::handleShadeCommand(WebServer& server) {
     if (shade) {
       Serial.print("Received:");
       Serial.println(server.arg("plain"));
-      // Send the command to the shade.
-      if (target <= 100)
-          shade->moveToTarget(shade->transformPosition(target));
-      else
-          shade->sendCommand(command, repeat > 0 ? repeat : shade->repeats, stepSize);
+      if (target <= 100) {
+        shade->moveToTarget(shade->transformPosition(target));
+      }
+      else {
+        shade->sendCommand(command, repeat > 0 ? repeat : shade->repeats, stepSize);
+      }
       JsonResponse resp;
       resp.beginResponse(&server, g_content, sizeof(g_content));
       resp.beginObject();
       shade->toJSONRef(resp);
+      resp.addElem("ok", true);
+      resp.addElem("cmdStatus", "ok");
       resp.endObject();
       resp.endResponse();
     }
@@ -509,6 +590,7 @@ void Web::handleShadeCommand(WebServer& server) {
 }
 void Web::handleRepeatCommand(WebServer& server) {
   webServer.sendCORSHeaders(server);
+  if(mesh.isRepeater()) { server.send(403, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Repeater\"}")); return; }
   HTTPMethod method = server.method();
   if (method == HTTP_OPTIONS) { server.send(200, "OK"); return; }
   uint8_t shadeId = 255;
@@ -595,10 +677,13 @@ void Web::handleRepeatCommand(WebServer& server) {
 void Web::handleGroupCommand(WebServer &server) {
   webServer.sendCORSHeaders(server);
   if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
+  if(mesh.isRepeater()) { server.send(403, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Repeater\"}")); return; }
   HTTPMethod method = server.method();
   uint8_t groupId = 255;
   uint8_t stepSize = 0;
   int8_t repeat = -1;
+  uint8_t bitLengthOverride = 0;
+  int16_t protoOverride = -1;
   somfy_commands command = somfy_commands::My;
   if (method == HTTP_GET || method == HTTP_PUT || method == HTTP_POST) {
     if (server.hasArg("groupId")) {
@@ -606,6 +691,8 @@ void Web::handleGroupCommand(WebServer &server) {
       if (server.hasArg("command")) command = translateSomfyCommand(server.arg("command"));
       if(server.hasArg("repeat")) repeat = atoi(server.arg("repeat").c_str());
       if(server.hasArg("stepSize")) stepSize = atoi(server.arg("stepSize").c_str());
+      if(server.hasArg("bitLength")) bitLengthOverride = atoi(server.arg("bitLength").c_str());
+      if(server.hasArg("proto")) protoOverride = atoi(server.arg("proto").c_str());
     }
     else if (server.hasArg("plain")) {
       Serial.println("Sending Group Command");
@@ -628,6 +715,8 @@ void Web::handleGroupCommand(WebServer &server) {
         }
         if(obj.containsKey("repeat")) repeat = obj["repeat"].as<uint8_t>();
         if(obj.containsKey("stepSize")) stepSize = obj["stepSize"].as<uint8_t>();
+        if(obj.containsKey("bitLength")) bitLengthOverride = obj["bitLength"].as<uint8_t>();
+        if(obj.containsKey("proto")) protoOverride = obj["proto"].as<int16_t>();
       }
     }
     else server.send(500, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"No group object supplied.\"}"));
@@ -635,12 +724,20 @@ void Web::handleGroupCommand(WebServer &server) {
     if (group) {
       Serial.print("Received:");
       Serial.println(server.arg("plain"));
-      // Send the command to the group.
+      // Optional one-shot RF overrides for pairing PROG — do not persist on the group.
+      const uint8_t savedBit = group->bitLength;
+      const radio_proto savedProto = group->proto;
+      if(bitLengthOverride != 0) group->bitLength = bitLengthOverride;
+      if(protoOverride >= 0) group->proto = static_cast<radio_proto>(protoOverride);
       group->sendCommand(command, repeat >= 0 ? repeat : group->repeats, stepSize);
+      group->bitLength = savedBit;
+      group->proto = savedProto;
       JsonResponse resp;
       resp.beginResponse(&server, g_content, sizeof(g_content));
       resp.beginObject();
       group->toJSONRef(resp);
+      resp.addElem("ok", true);
+      resp.addElem("cmdStatus", "ok");
       resp.endObject();
       resp.endResponse();
     }
@@ -654,6 +751,7 @@ void Web::handleGroupCommand(WebServer &server) {
 void Web::handleTiltCommand(WebServer &server) {
   webServer.sendCORSHeaders(server);
   if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
+  if(mesh.isRepeater()) { server.send(403, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Repeater\"}")); return; }
   HTTPMethod method = server.method();
   uint8_t shadeId = 255;
   uint8_t target = 255;
@@ -808,13 +906,30 @@ void Web::handleShade(WebServer &server) {
         if (obj.containsKey("shadeId")) {
           SomfyShade* shade = somfy.getShadeById(obj["shadeId"]);
           if (shade) {
+            // Stop any in-progress move before applying invert/travel settings.
+            const bool touchesMotionCfg =
+              obj.containsKey("flipCommands") || obj.containsKey("flipPosition") ||
+              obj.containsKey("upTime") || obj.containsKey("downTime") || obj.containsKey("tiltTime");
+            bool stoppedMove = false;
+            if(touchesMotionCfg) stoppedMove = shade->stopIfMoving();
             uint8_t err = shade->fromJSON(obj);
             if(err == 0) {
+              // Apply reported position after flip flags so 0%=open / 100%=closed matches UI.
+              if(obj.containsKey("position") || obj.containsKey("tiltPosition")) {
+                int pos = obj.containsKey("position") ? obj["position"].as<int>() : -1;
+                int tiltPos = obj.containsKey("tiltPosition") ? obj["tiltPosition"].as<int>() : -1;
+                shade->calibratePosition(pos, tiltPos);
+              }
               shade->save();
+              shade->emitState();
+              alexaHue.rebuildDevices();
               JsonResponse resp;
               resp.beginResponse(&server, g_content, sizeof(g_content));
               resp.beginObject();
               shade->toJSON(resp);
+              resp.addElem("ok", true);
+              resp.addElem("cmdStatus", "ok");
+              if(stoppedMove) resp.addElem("stoppedMove", true);
               resp.endObject();
               resp.endResponse();
             }
@@ -909,7 +1024,11 @@ void Web::handleDiscovery(WebServer &server) {
     resp.addElem("permissions", settings.Security.permissions);
     resp.addElem("chipModel", settings.chipModel);
     resp.addElem("connType", connType);
+    resp.addElem("meshRole", (uint8_t)mesh.role);
     resp.addElem("checkForUpdate", settings.checkForUpdate);
+    resp.addElem("alexaHueEnabled", settings.alexaHueEnabled);
+    resp.addElem("alexaHueCount", alexaHue.exposedCount());
+    resp.addElem("alexaHueMax", alexaHue.maxDevices());
     resp.beginObject("memory");
     resp.addElem("max", ESP.getMaxAllocHeap());
     resp.addElem("free", ESP.getFreeHeap());
@@ -925,6 +1044,10 @@ void Web::handleDiscovery(WebServer &server) {
     resp.beginArray("groups");
     somfy.toJSONGroups(resp);
     resp.endArray();
+    resp.addElem("maxFixedCodes", (uint8_t)FIXED_MAX_SWITCHES);
+    resp.beginArray("fixedCodes");
+    fixedCodes.toJSON(resp);
+    resp.endArray();
     resp.endObject();
     resp.endResponse();
     server.client().stop();
@@ -932,6 +1055,84 @@ void Web::handleDiscovery(WebServer &server) {
   }
   else
     server.send(500, _encoding_text, "Invalid http method");
+}
+void Web::handleGetFixedCodes(WebServer &server) {
+  webServer.sendCORSHeaders(server);
+  if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
+  JsonResponse resp;
+  resp.beginResponse(&server, g_content, sizeof(g_content));
+  resp.beginArray();
+  fixedCodes.toJSON(resp);
+  resp.endArray();
+  resp.endResponse();
+}
+void Web::handleSaveFixedCode(WebServer &server) {
+  webServer.sendCORSHeaders(server);
+  if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
+  if(fixedCodes.isLearning()) {
+    server.send(409, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Busy learning.\"}"));
+    return;
+  }
+  if(!server.hasArg("plain")) {
+    server.send(500, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"No fixed code object supplied.\"}"));
+    return;
+  }
+  DynamicJsonDocument doc(512);
+  DeserializationError err = deserializeJson(doc, server.arg("plain"));
+  if(err) { webServer.handleDeserializationError(server, err); return; }
+  JsonObject obj = doc.as<JsonObject>();
+  if(!fixedCodes.saveSwitch(obj)) {
+    server.send(500, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Fixed code switch not found.\"}"));
+    return;
+  }
+  // HA/UI settings must hit disk immediately (not wait for 1s dirty timer).
+  fixedCodes.commit();
+  FixedCodeSwitch *sw = fixedCodes.getById(obj["id"].as<uint8_t>());
+  JsonResponse resp;
+  resp.beginResponse(&server, g_content, sizeof(g_content));
+  resp.beginObject();
+  sw->toJSON(resp);
+  resp.endObject();
+  resp.endResponse();
+}
+void Web::handleFixedCodeCommand(WebServer &server) {
+  webServer.sendCORSHeaders(server);
+  if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
+  if(mesh.isRepeater()) { server.send(403, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Repeater\"}")); return; }
+  uint8_t id = 0;
+  String state = "";
+  if(server.hasArg("id")) id = atoi(server.arg("id").c_str());
+  if(server.hasArg("state")) state = server.arg("state");
+  if(server.hasArg("plain")) {
+    DynamicJsonDocument doc(256);
+    DeserializationError err = deserializeJson(doc, server.arg("plain"));
+    if(err) { webServer.handleDeserializationError(server, err); return; }
+    JsonObject obj = doc.as<JsonObject>();
+    if(obj.containsKey("id")) id = obj["id"];
+    if(obj.containsKey("state")) state = obj["state"].as<String>();
+  }
+  uint32_t retryAfterMs = 0;
+  fixed_cmd_result result = fixedCodes.command(id, state.c_str(), &retryAfterMs);
+  if(result == fixed_cmd_result::rate_limited) {
+    snprintf(g_content, sizeof(g_content),
+      "{\"ok\":false,\"cmdStatus\":\"rate_limited\",\"retryAfterMs\":%u,\"id\":%u}",
+      (unsigned)retryAfterMs, (unsigned)id);
+    server.send(429, _encoding_json, g_content);
+    return;
+  }
+  if(result != fixed_cmd_result::ok) {
+    server.send(500, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Command failed (missing codes or invalid id).\"}"));
+    return;
+  }
+  FixedCodeSwitch *sw = fixedCodes.getById(id);
+  JsonResponse resp;
+  resp.beginResponse(&server, g_content, sizeof(g_content));
+  resp.beginObject();
+  sw->toJSON(resp);
+  resp.addElem("ok", true);
+  resp.addElem("cmdStatus", "ok");
+  resp.endObject();
+  resp.endResponse();
 }
 void Web::handleBackup(WebServer &server, bool attach) {
   webServer.sendCORSHeaders(server);
@@ -963,9 +1164,15 @@ void Web::handleBackup(WebServer &server, bool attach) {
 void Web::handleSetPositions(WebServer &server) {
   webServer.sendCORSHeaders(server);
   if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
+  if(mesh.isRepeater()) { server.send(403, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Repeater\"}")); return; }
+  if(server.method() != HTTP_PUT && server.method() != HTTP_POST) {
+    server.send(405, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Use PUT/POST\"}"));
+    return;
+  }
   uint8_t shadeId = (server.hasArg("shadeId")) ? atoi(server.arg("shadeId").c_str()) : 255;
-  int8_t pos = (server.hasArg("position")) ? atoi(server.arg("position").c_str()) : -1;
-  int8_t tiltPos = (server.hasArg("tiltPosition")) ? atoi(server.arg("tiltPosition").c_str()) : -1;
+  // Use int (not int8_t): ArduinoJson/int8 assignment can mishandle 0..100 values.
+  int pos = (server.hasArg("position")) ? atoi(server.arg("position").c_str()) : -1;
+  int tiltPos = (server.hasArg("tiltPosition")) ? atoi(server.arg("tiltPosition").c_str()) : -1;
   if(server.hasArg("plain")) {
     DynamicJsonDocument doc(512);
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
@@ -975,21 +1182,24 @@ void Web::handleSetPositions(WebServer &server) {
     }
     else {
       JsonObject obj = doc.as<JsonObject>();
-      if(obj.containsKey("shadeId")) shadeId = obj["shadeId"];
-      if(obj.containsKey("position")) pos = obj["position"];
-      if(obj.containsKey("tiltPosition")) tiltPos = obj["tiltPosition"];
+      if(obj.containsKey("shadeId")) shadeId = obj["shadeId"].as<uint8_t>();
+      if(obj.containsKey("position")) pos = obj["position"].as<int>();
+      if(obj.containsKey("tiltPosition")) tiltPos = obj["tiltPosition"].as<int>();
     }
   }
   if(shadeId != 255) {
     SomfyShade *shade = somfy.getShadeById(shadeId);
     if(shade) {
-      if(pos >= 0) shade->target = shade->currentPos = pos;
-      if(tiltPos >= 0 && shade->tiltType != tilt_types::none) shade->tiltTarget = shade->currentTiltPos = tiltPos;
+      // Same API scale as /shadeCommand targets (transform when flipPosition).
+      shade->calibratePosition(pos, tiltPos);
+      // Persist immediately — dirty timer alone can lose calibrate on quick reopen/reboot.
+      somfy.commit();
       shade->emitState();
       JsonResponse resp;
       resp.beginResponse(&server, g_content, sizeof(g_content));
       resp.beginObject();
       shade->toJSON(resp);
+      resp.addElem("ok", true);
       resp.endObject();
       resp.endResponse();
     }
@@ -1083,10 +1293,14 @@ void Web::handleDownloadFirmware(WebServer &server) {
         rel = &repo.releases[GIT_MAX_RELEASES];
       }
       else {
+        const char *want = server.arg("ver").c_str();
         for(uint8_t i = 0; i < GIT_MAX_RELEASES; i++) {
           if(repo.releases[i].id == 0) continue;
-          if(strcmp(repo.releases[i].name, server.arg("ver").c_str()) == 0) {
-            rel = &repo.releases[i];  
+          // UI sends tag_name (version.name); GitHub "name" is the release title.
+          if(strcmp(repo.releases[i].version.name, want) == 0 ||
+             strcmp(repo.releases[i].name, want) == 0) {
+            rel = &repo.releases[i];
+            break;
           }
         }
       }
@@ -1097,7 +1311,8 @@ void Web::handleDownloadFirmware(WebServer &server) {
         rel->toJSON(resp);
         resp.endObject();
         resp.endResponse();
-        strcpy(git.targetRelease, rel->name);
+        const char *tag = rel->version.name[0] ? rel->version.name : rel->name;
+        strlcpy(git.targetRelease, tag, sizeof(git.targetRelease));
         git.status = GIT_AWAITING_UPDATE;
       }
       else
@@ -1115,6 +1330,7 @@ void Web::handleNotFound(WebServer &server) {
     server.send(200, _encoding_text, F("OK"));
     return;
   }
+  if(alexaHue.handleHttp(server)) return;
   Serial.print(F("404: "));
   Serial.println(server.uri());
 
@@ -1146,15 +1362,23 @@ void Web::begin() {
   apiServer.on("/rooms", []() {webServer.handleGetRooms(apiServer); });
   apiServer.on("/shades", []() { webServer.handleGetShades(apiServer); });
   apiServer.on("/groups", []() { webServer.handleGetGroups(apiServer); });
+  apiServer.on("/fixedCodes", []() { webServer.handleGetFixedCodes(apiServer); });
   apiServer.on("/login", []() { webServer.handleLogin(apiServer); });
   apiServer.onNotFound([]() { webServer.handleNotFound(apiServer); });
   apiServer.on("/controller", []() { webServer.handleController(apiServer); });
   apiServer.on("/shadeCommand", []() { webServer.handleShadeCommand(apiServer); });
   apiServer.on("/groupCommand", []() { webServer.handleGroupCommand(apiServer); });
+  auto apiAuto = []() { webServer.sendCORSHeaders(apiServer); if(automation) automation->handleHttp(apiServer); };
+  apiServer.on("/scenes", apiAuto);
+  apiServer.on("/schedules", apiAuto);
+  apiServer.on("/sceneCommand", apiAuto);
+  apiServer.on("/roomCommand", apiAuto);
   apiServer.on("/tiltCommand", []() { webServer.handleTiltCommand(apiServer); });
   apiServer.on("/repeatCommand", []() { webServer.handleRepeatCommand(apiServer); });
+  apiServer.on("/fixedCodeCommand", []() { webServer.handleFixedCodeCommand(apiServer); });
+  apiServer.on("/saveFixedCode", []() { webServer.handleSaveFixedCode(apiServer); });
   apiServer.on("/room", HTTP_GET, [] () { webServer.handleRoom(apiServer); });
-  apiServer.on("/shade", HTTP_GET, [] () { webServer.handleShade(apiServer); });
+  apiServer.on("/shade", [] () { webServer.handleShade(apiServer); });
   apiServer.on("/group", HTTP_GET, [] () { webServer.handleGroup(apiServer); });
   apiServer.on("/setPositions", []() { webServer.handleSetPositions(apiServer); });
   apiServer.on("/setSensor", []() { webServer.handleSetSensor(apiServer); });
@@ -1169,12 +1393,36 @@ void Web::begin() {
   server.on("/repeatCommand", []() { webServer.handleRepeatCommand(server); });
   server.on("/shadeCommand", []() { webServer.handleShadeCommand(server); });
   server.on("/groupCommand", []() { webServer.handleGroupCommand(server); });
+  auto uiAuto = []() { webServer.sendCORSHeaders(server); if(automation) automation->handleHttp(server); };
+  server.on("/scenes", uiAuto);
+  server.on("/schedules", uiAuto);
+  server.on("/sceneCommand", uiAuto);
+  server.on("/roomCommand", uiAuto);
   server.on("/setPositions", []() { webServer.handleSetPositions(server); });
   server.on("/setSensor", []() { webServer.handleSetSensor(server); });
   server.on("/upnp.xml", []() { SSDP.schema(server.client()); });
+  server.on("/description.xml", []() {
+    if(!alexaHue.handleHttp(server))
+      server.send(404, "text/plain", "Alexa Hue bridge is disabled");
+  });
   server.on("/", []() { webServer.handleStreamFile(server, "/index.html.gz", _encoding_html); });
   server.on("/login", []() { webServer.handleLogin(server); });
   server.on("/loginContext", []() { webServer.handleLoginContext(server); });
+  auto meshApi = []() { webServer.sendCORSHeaders(server); mesh.handleApi(server); };
+  server.on("/mesh", []() { webServer.sendCORSHeaders(server); mesh.handleHttp(server); });
+  server.on("/mesh/state", meshApi);
+  server.on("/mesh/role", meshApi);
+  server.on("/mesh/txMode", meshApi);
+  server.on("/mesh/unpair", meshApi);
+  server.on("/mesh/peerName", meshApi);
+  server.on("/mesh/resetRanks", meshApi);
+  server.on("/mesh/roomRadio", meshApi);
+  server.on("/mesh/resetOriginal", meshApi);
+  server.on("/mesh/pushStatus", meshApi);
+  server.on("/mesh/pushUpdate", HTTP_PUT, []() { webServer.sendCORSHeaders(server); mesh.handlePushUpdate(server); });
+  server.on("/mesh/pushUpdate", HTTP_POST,
+    []() { webServer.sendCORSHeaders(server); mesh.handlePushUpdate(server); },
+    []() { mesh.handlePushUpload(server); });
   server.on("/shades.cfg", []() { webServer.handleStreamFile(server, "/shades.cfg", _encoding_text); });
   server.on("/shades.tmp", []() { webServer.handleStreamFile(server, "/shades.tmp", _encoding_text); });
   server.on("/getReleases", []() {
@@ -1232,8 +1480,22 @@ void Web::begin() {
       else {
         Serial.println("No restore options sent.  Using defaults...");
         opts.shades = true;
+        opts.fixedCodes = true;
+        opts.automation = true;
       }
       ShadeConfigFile::restore(&somfy, "/shades.tmp", opts);
+      if(opts.fixedCodes) {
+        if(fixedCodes.restoreFromBackup()) Serial.println("Restored RF switches from backup");
+        else Serial.println("No RF switches section in backup (skipped)");
+      }
+      if(opts.automation && automation) {
+        if(automation->restoreFromBackup()) Serial.println("Restored scenes/schedules from backup");
+        else Serial.println("No scenes/schedules section in backup (skipped)");
+      }
+      if(opts.repeaters) {
+        if(mesh.restoreFromBackup()) Serial.println("Restored mesh config from backup");
+        else Serial.println("No mesh section in backup (skipped)");
+      }
       Serial.println("Rebooting ESP for restored settings...");
       rebootDelay.reboot = true;
       rebootDelay.rebootTime = millis() + 1000;
@@ -1302,6 +1564,19 @@ void Web::begin() {
     resp.endObject();
     resp.endResponse();
     });
+  server.on("/getNextRemoteAddress", []() {
+    webServer.sendCORSHeaders(server);
+    if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
+    uint8_t shadeId = 1;
+    if(server.hasArg("shadeId")) shadeId = atoi(server.arg("shadeId").c_str());
+    if(shadeId == 0 || shadeId == 255) shadeId = 1;
+    JsonResponse resp;
+    resp.beginResponse(&server, g_content, sizeof(g_content));
+    resp.beginObject();
+    resp.addElem("remoteAddress", (uint32_t)somfy.getNextRemoteAddress(shadeId));
+    resp.endObject();
+    resp.endResponse();
+    });
   server.on("/getNextGroup", []() {
     webServer.sendCORSHeaders(server);
     uint8_t groupId = somfy.getNextGroupId();
@@ -1330,7 +1605,7 @@ void Web::begin() {
       else {
         JsonObject obj = doc.as<JsonObject>();
         Serial.println("Counting rooms");
-        if (somfy.roomCount() > SOMFY_MAX_ROOMS) {
+        if (somfy.roomCount() >= SOMFY_MAX_ROOMS) {
           server.send(500, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Maximum number of rooms exceeded.\"}"));
           return;
         }
@@ -1371,7 +1646,7 @@ void Web::begin() {
       else {
         JsonObject obj = doc.as<JsonObject>();
         Serial.println("Counting shades");
-        if (somfy.shadeCount() > SOMFY_MAX_SHADES) {
+        if (somfy.shadeCount() >= SOMFY_MAX_SHADES) {
           server.send(500, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Maximum number of shades exceeded.\"}"));
           return;
         }
@@ -1382,6 +1657,7 @@ void Web::begin() {
             server.send(500, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Error adding shade.\"}"));
             return;
           }
+          alexaHue.rebuildDevices();
         }
       }
     }
@@ -1538,13 +1814,29 @@ void Web::begin() {
           if (obj.containsKey("shadeId")) {
             SomfyShade* shade = somfy.getShadeById(obj["shadeId"]);
             if (shade) {
+              const bool touchesMotionCfg =
+                obj.containsKey("flipCommands") || obj.containsKey("flipPosition") ||
+                obj.containsKey("upTime") || obj.containsKey("downTime") || obj.containsKey("tiltTime");
+              bool stoppedMove = false;
+              if(touchesMotionCfg) stoppedMove = shade->stopIfMoving();
               int8_t err = shade->fromJSON(obj);
               if(err == 0) {
+                // Apply reported position after flip flags so 0%=open / 100%=closed matches UI.
+                if(obj.containsKey("position") || obj.containsKey("tiltPosition")) {
+                  int pos = obj.containsKey("position") ? obj["position"].as<int>() : -1;
+                  int tiltPos = obj.containsKey("tiltPosition") ? obj["tiltPosition"].as<int>() : -1;
+                  shade->calibratePosition(pos, tiltPos);
+                }
                 shade->save();
+                shade->emitState();
+                alexaHue.rebuildDevices();
                 JsonResponse resp;
                 resp.beginResponse(&server, g_content, sizeof(g_content));
                 resp.beginObject();
                 shade->toJSON(resp);
+                resp.addElem("ok", true);
+                resp.addElem("cmdStatus", "ok");
+                if(stoppedMove) resp.addElem("stoppedMove", true);
                 resp.endObject();
                 resp.endResponse();
               }
@@ -1633,12 +1925,14 @@ void Web::begin() {
         if(shade->tiltType == tilt_types::none) tilt = -1;
         if(pos >= 0 && pos <= 100)
           shade->setMyPosition(shade->transformPosition(pos), shade->transformPosition(tilt));
-          JsonResponse resp;
-          resp.beginResponse(&server, g_content, sizeof(g_content));
-          resp.beginObject();
-          shade->toJSONRef(resp);
-          resp.endObject();
-          resp.endResponse();
+        // Persist favorite immediately when written (dirty timer alone can lose it).
+        somfy.commit();
+        JsonResponse resp;
+        resp.beginResponse(&server, g_content, sizeof(g_content));
+        resp.beginObject();
+        shade->toJSONRef(resp);
+        resp.endObject();
+        resp.endResponse();
       }
       else {
         server.send(500, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Shade with the specified id not found.\"}"));
@@ -1679,6 +1973,7 @@ void Web::begin() {
       }
       else {
         shade->setRollingCode(rollingCode);
+        somfy.commit();
         JsonResponse resp;
         resp.beginResponse(&server, g_content, sizeof(g_content));
         resp.beginObject();
@@ -1718,6 +2013,7 @@ void Web::begin() {
     else {
       shade->paired = paired;
       shade->save();
+      shade->emitState();
       JsonResponse resp;
       resp.beginResponse(&server, g_content, sizeof(g_content));
       resp.beginObject();
@@ -2087,6 +2383,7 @@ void Web::begin() {
     }
     else {
       somfy.deleteShade(shadeId);
+      alexaHue.rebuildDevices();
       server.send(200, _encoding_json, F("{\"status\":\"SUCCESS\",\"desc\":\"Shade deleted.\"}"));
     }
     });
@@ -2122,15 +2419,155 @@ void Web::begin() {
       server.send(200, _encoding_json, F("{\"status\":\"SUCCESS\",\"desc\":\"Group deleted.\"}"));
     }
     });
+  server.on("/fixedCodes", []() {
+    webServer.sendCORSHeaders(server);
+    if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
+    JsonResponse resp;
+    resp.beginResponse(&server, g_content, sizeof(g_content));
+    resp.beginArray();
+    fixedCodes.toJSON(resp);
+    resp.endArray();
+    resp.endResponse();
+  });
+  server.on("/addFixedCode", []() {
+    webServer.sendCORSHeaders(server);
+    if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
+    if(fixedCodes.isLearning()) {
+      server.send(409, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Busy learning.\"}"));
+      return;
+    }
+    if(!server.hasArg("plain")) {
+      server.send(500, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"No fixed code object supplied.\"}"));
+      return;
+    }
+    DynamicJsonDocument doc(512);
+    DeserializationError err = deserializeJson(doc, server.arg("plain"));
+    if(err) { webServer.handleDeserializationError(server, err); return; }
+    JsonObject obj = doc.as<JsonObject>();
+    FixedCodeSwitch *sw = fixedCodes.add(obj);
+    if(!sw) {
+      server.send(500, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Unable to add fixed code switch (max reached).\"}"));
+      return;
+    }
+    JsonResponse resp;
+    resp.beginResponse(&server, g_content, sizeof(g_content));
+    resp.beginObject();
+    sw->toJSON(resp);
+    resp.endObject();
+    resp.endResponse();
+  });
+  server.on("/saveFixedCode", []() { webServer.handleSaveFixedCode(server); });
+  server.on("/deleteFixedCode", []() {
+    webServer.sendCORSHeaders(server);
+    if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
+    uint8_t id = 0;
+    if(server.hasArg("id")) id = atoi(server.arg("id").c_str());
+    else if(server.hasArg("plain")) {
+      DynamicJsonDocument doc(256);
+      DeserializationError err = deserializeJson(doc, server.arg("plain"));
+      if(err) { webServer.handleDeserializationError(server, err); return; }
+      JsonObject obj = doc.as<JsonObject>();
+      if(obj.containsKey("id")) id = obj["id"];
+    }
+    if(!fixedCodes.remove(id)) {
+      server.send(500, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Fixed code switch not found.\"}"));
+      return;
+    }
+    server.send(200, _encoding_json, F("{\"status\":\"SUCCESS\",\"desc\":\"Fixed code switch deleted.\"}"));
+  });
+  server.on("/fixedCodeCommand", []() {
+    webServer.sendCORSHeaders(server);
+    if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
+    uint8_t id = 0;
+    String state = "";
+    if(server.hasArg("id")) id = atoi(server.arg("id").c_str());
+    if(server.hasArg("state")) state = server.arg("state");
+    if(server.hasArg("plain")) {
+      DynamicJsonDocument doc(256);
+      DeserializationError err = deserializeJson(doc, server.arg("plain"));
+      if(err) { webServer.handleDeserializationError(server, err); return; }
+      JsonObject obj = doc.as<JsonObject>();
+      if(obj.containsKey("id")) id = obj["id"];
+      if(obj.containsKey("state")) state = obj["state"].as<String>();
+    }
+    uint32_t retryAfterMs = 0;
+    fixed_cmd_result result = fixedCodes.command(id, state.c_str(), &retryAfterMs);
+    if(result == fixed_cmd_result::rate_limited) {
+      snprintf(g_content, sizeof(g_content),
+        "{\"ok\":false,\"cmdStatus\":\"rate_limited\",\"retryAfterMs\":%u,\"id\":%u}",
+        (unsigned)retryAfterMs, (unsigned)id);
+      server.send(429, _encoding_json, g_content);
+      return;
+    }
+    if(result != fixed_cmd_result::ok) {
+      server.send(500, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Command failed (missing codes or invalid id).\"}"));
+      return;
+    }
+    FixedCodeSwitch *sw = fixedCodes.getById(id);
+    JsonResponse resp;
+    resp.beginResponse(&server, g_content, sizeof(g_content));
+    resp.beginObject();
+    sw->toJSON(resp);
+    resp.addElem("ok", true);
+    resp.addElem("cmdStatus", "ok");
+    resp.endObject();
+    resp.endResponse();
+  });
+  server.on("/fixedCodeLearn", []() {
+    webServer.sendCORSHeaders(server);
+    if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
+    uint8_t id = 0;
+    String button = "on";
+    String action = "start";
+    if(server.hasArg("id")) id = atoi(server.arg("id").c_str());
+    if(server.hasArg("button")) button = server.arg("button");
+    if(server.hasArg("action")) action = server.arg("action");
+    if(server.hasArg("plain")) {
+      DynamicJsonDocument doc(256);
+      DeserializationError err = deserializeJson(doc, server.arg("plain"));
+      if(err) { webServer.handleDeserializationError(server, err); return; }
+      JsonObject obj = doc.as<JsonObject>();
+      if(obj.containsKey("id")) id = obj["id"];
+      if(obj.containsKey("button")) button = obj["button"].as<String>();
+      if(obj.containsKey("action")) action = obj["action"].as<String>();
+    }
+    if(action.equalsIgnoreCase("stop") || action.equalsIgnoreCase("cancel")) {
+      fixedCodes.endLearn(true);
+      server.send(200, _encoding_json, F("{\"status\":\"SUCCESS\",\"desc\":\"Learn cancelled.\"}"));
+      return;
+    }
+    fixed_learn_btn btn = button.equalsIgnoreCase("off") ? fixed_learn_btn::off : fixed_learn_btn::on;
+    if(!fixedCodes.beginLearn(id, btn)) {
+      server.send(500, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"Unable to start learn mode.\"}"));
+      return;
+    }
+    server.send(200, _encoding_json, F("{\"status\":\"SUCCESS\",\"desc\":\"Learn started. Press the remote button.\"}"));
+  });
   server.on("/updateFirmware", HTTP_POST, []() {
     webServer.sendCORSHeaders(server);
     if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
-    if (Update.hasError())
+    server.sendHeader("Connection", "close");
+    bool ok = webServer.uploadSuccess && !Update.hasError();
+    if (!ok)
       server.send(500, _encoding_json, "{\"status\":\"ERROR\",\"desc\":\"Error updating firmware: \"}");
     else
       server.send(200, _encoding_json, "{\"status\":\"SUCCESS\",\"desc\":\"Successfully updated firmware\"}");
-    rebootDelay.reboot = true;
-    rebootDelay.rebootTime = millis() + 500;
+    // ?reboot=0 defers reboot so a multi-part package can flash FW then FS before one reboot
+    bool doReboot = true;
+    if(server.hasArg("reboot")) {
+      String r = server.arg("reboot");
+      if(r == "0" || r.equalsIgnoreCase("false") || r.equalsIgnoreCase("no")) doReboot = false;
+    }
+    if(ok && !doReboot) {
+      // New FW is the next boot target; roll it back if the following FS stage fails.
+      webServer.pendingFwRollback = true;
+    }
+    if(ok && doReboot) {
+      webServer.pendingFwRollback = false;
+      rebootDelay.reboot = true;
+      // Give the browser time to receive SUCCESS before the device drops Wi‑Fi.
+      rebootDelay.rebootTime = millis() + 2000;
+    }
     }, []() {
       HTTPUpload& upload = server.upload();
       if (upload.status == UPLOAD_FILE_START) {
@@ -2138,7 +2575,7 @@ void Web::begin() {
         Serial.printf("Update: %s - %d\n", upload.filename.c_str(), upload.totalSize);
         //if(!Update.begin(upload.totalSize, U_SPIFFS)) {
         if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { //start with max available size
-          Update.printError(Serial);
+          ;
         }
         else {
           somfy.transceiver.end(); // Shut down the radio so we do not get any interrupts during this process.
@@ -2152,18 +2589,15 @@ void Web::begin() {
       else if (upload.status == UPLOAD_FILE_WRITE) {
         /* flashing firmware to ESP*/
         if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-          Update.printError(Serial);
+          ;
           Serial.printf("Upload of %s aborted invalid size %d\n", upload.filename.c_str(), upload.currentSize);
           Update.abort();
         }
       }
       else if (upload.status == UPLOAD_FILE_END) {
         if (Update.end(true)) { //true to set the size to the current progress
-          Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
           webServer.uploadSuccess = true;
-        }
-        else {
-          Update.printError(Serial);
+          Serial.printf("Update Success: %u\n", upload.totalSize);
         }
       }
       esp_task_wdt_reset();
@@ -2200,22 +2634,47 @@ void Web::begin() {
     webServer.sendCORSHeaders(server);
     if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
     server.sendHeader("Connection", "close");
-    if (Update.hasError())
-      server.send(500, _encoding_json, "{\"status\":\"ERROR\",\"desc\":\"Error updating application: \"}");
-    else
-      server.send(200, _encoding_json, "{\"status\":\"SUCCESS\",\"desc\":\"Successfully updated application\"}");
-    rebootDelay.reboot = true;
-    rebootDelay.rebootTime = millis() + 500;
+    bool ok = webServer.uploadSuccess && !Update.hasError();
+    bool mounted = false;
+    if(ok) mounted = webServer.remountFilesystemAfterUpdate(true);
+    if(!ok || !mounted) {
+      webServer.recoverUserConfigAfterFsFailure();
+      webServer.rollbackPendingFirmware();
+      server.send(500, _encoding_json,
+        !ok
+          ? "{\"status\":\"ERROR\",\"desc\":\"Error updating application: \"}"
+          : "{\"status\":\"ERROR\",\"desc\":\"Application flashed but filesystem remount failed\"}");
+      return;
+    }
+
+    // Reply first so the browser leaves 100% instead of waiting on shade commits.
+    server.send(200, _encoding_json, "{\"status\":\"SUCCESS\",\"desc\":\"Successfully updated application\"}");
+
+    webServer.restoreUserConfigToFilesystem();
+    webServer.pendingFwRollback = false;
+
+    bool doReboot = true;
+    if(server.hasArg("reboot")) {
+      String r = server.arg("reboot");
+      if(r == "0" || r.equalsIgnoreCase("false") || r.equalsIgnoreCase("no")) doReboot = false;
+    }
+    if(doReboot) {
+      rebootDelay.reboot = true;
+      // Longer delay: client must receive SUCCESS and shade restore may still be flushing.
+      rebootDelay.rebootTime = millis() + 5000;
+    }
     }, []() {
       HTTPUpload& upload = server.upload();
       if (upload.status == UPLOAD_FILE_START) {
         webServer.uploadSuccess = false;
         Serial.printf("Update: %s %d\n", upload.filename.c_str(), upload.totalSize);
-        //if(!Update.begin(upload.totalSize, U_SPIFFS)) {
+        LittleFS.end(); // avoid writing while mounted over the same partition
         if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_SPIFFS)) { //start with max available size and tell it we are updating the file system.
-          Update.printError(Serial);
+          ;
         }
         else {
+          // Block shade/fixed-code commits while the FS partition is being rewritten.
+          git.lockFS = true;
           somfy.transceiver.end(); // Shut down the radio so we do not get any interrupts during this process.
           mqtt.end();
         }
@@ -2223,25 +2682,25 @@ void Web::begin() {
       else if(upload.status == UPLOAD_FILE_ABORTED) {
         Serial.printf("Upload of %s aborted\n", upload.filename.c_str());
         Update.abort();
-        somfy.commit();
+        // Response handler remounts/restores; unlock here so recovery can write.
+        git.lockFS = false;
       }
       else if (upload.status == UPLOAD_FILE_WRITE) {
         /* flashing littlefs to ESP*/
         if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-          Update.printError(Serial);
+          ;
           Serial.printf("Upload of %s aborted invalid size %d\n", upload.filename.c_str(), upload.currentSize);
           Update.abort();
+          git.lockFS = false;
         }
       }
       else if (upload.status == UPLOAD_FILE_END) {
         if (Update.end(true)) { //true to set the size to the current progress
           webServer.uploadSuccess = true;
-          Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
-          somfy.commit();
+          Serial.printf("Update Success: %u\n", upload.totalSize);
         }
         else {
-          somfy.commit();
-          Update.printError(Serial);
+          git.lockFS = false;
         }
       }
       esp_task_wdt_reset();
@@ -2293,8 +2752,11 @@ void Web::begin() {
 
     if (server.method() == HTTP_POST || server.method() == HTTP_PUT) {
       JsonObject obj = doc.as<JsonObject>();
+      char oldPass[33];
+      strlcpy(oldPass, settings.Security.password, sizeof(oldPass));
       settings.Security.fromJSON(obj);
       settings.Security.save();
+      mesh.syncSettingsToPeers(oldPass);
 
       doc.clear();
       obj = doc.to<JsonObject>();
@@ -2330,6 +2792,7 @@ void Web::begin() {
       JsonObject obj = doc.as<JsonObject>();
       somfy.transceiver.fromJSON(obj);
       somfy.transceiver.save();
+      if(mesh.isRouter()) mesh.syncSettingsToPeers();
 
       JsonResponse resp;
       resp.beginResponse(&server, g_content, sizeof(g_content));
@@ -2355,17 +2818,25 @@ void Web::begin() {
     if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
     HTTPMethod method = server.method();
     if (method == HTTP_GET || method == HTTP_PUT || method == HTTP_POST) {
-      somfy_frame_t frame;
-      uint8_t repeats = 0;
+      uint32_t address = 0;
+      uint8_t repeats = 1;
+      uint8_t bitLength = 0;
+      uint8_t proto = 0;
+      uint16_t rcode = 0;
+      uint8_t encKey = 0;
+      somfy_commands command = somfy_commands::Prog;
+      bool hasRcode = false;
       if (server.hasArg("address")) {
-        frame.remoteAddress = atoi(server.arg("address").c_str());
-        if (server.hasArg("encKey")) frame.encKey = atoi(server.arg("encKey").c_str());
-        if (server.hasArg("command")) frame.cmd = translateSomfyCommand(server.arg("command"));
-        if (server.hasArg("rcode")) frame.rollingCode = atoi(server.arg("rcode").c_str());
+        address = atoi(server.arg("address").c_str());
+        if (server.hasArg("encKey")) encKey = atoi(server.arg("encKey").c_str());
+        if (server.hasArg("command")) command = translateSomfyCommand(server.arg("command"));
+        if (server.hasArg("rcode")) { rcode = atoi(server.arg("rcode").c_str()); hasRcode = true; }
         if (server.hasArg("repeats")) repeats = atoi(server.arg("repeats").c_str());
+        if (server.hasArg("bitLength")) bitLength = atoi(server.arg("bitLength").c_str());
+        if (server.hasArg("proto")) proto = atoi(server.arg("proto").c_str());
       }
       else if (server.hasArg("plain")) {
-        StaticJsonDocument<128> doc;
+        StaticJsonDocument<192> doc;
         DeserializationError err = deserializeJson(doc, server.arg("plain"));
         if (err) {
           webServer.handleDeserializationError(server, err);
@@ -2374,20 +2845,50 @@ void Web::begin() {
         else {
           JsonObject obj = doc.as<JsonObject>();
           String scmd;
-          if (obj.containsKey("address")) frame.remoteAddress = obj["address"];
+          if (obj.containsKey("address")) address = obj["address"];
           if (obj.containsKey("command")) scmd = obj["command"].as<String>();
           if (obj.containsKey("repeats")) repeats = obj["repeats"];
-          if (obj.containsKey("rcode")) frame.rollingCode = obj["rcode"];
-          if (obj.containsKey("encKey")) frame.encKey = obj["encKey"];
-          frame.cmd = translateSomfyCommand(scmd.c_str());
+          if (obj.containsKey("rcode")) { rcode = obj["rcode"]; hasRcode = true; }
+          if (obj.containsKey("encKey")) encKey = obj["encKey"];
+          if (obj.containsKey("bitLength")) bitLength = obj["bitLength"];
+          if (obj.containsKey("proto")) proto = obj["proto"];
+          command = translateSomfyCommand(scmd.c_str());
         }
       }
-      if (frame.remoteAddress > 0 && frame.rollingCode > 0) {
-        somfy.sendFrame(frame, repeats);
-        server.send(200, _encoding_json, F("{\"status\":\"SUCCESS\",\"desc\":\"Command Sent\"}"));
+      if (address == 0) {
+        server.send(500, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"No address provided\"}"));
+        return;
       }
-      else
-        server.send(500, _encoding_json, F("{\"status\":\"ERROR\",\"desc\":\"No address or rolling code provided\"}"));
+      // Prefer a known shade/group so UI state stays consistent.
+      for(uint8_t i = 0; i < SOMFY_MAX_SHADES; i++) {
+        SomfyShade *shade = &somfy.shades[i];
+        if(shade->getShadeId() != 255 && shade->getRemoteAddress() == address) {
+          if(bitLength) shade->bitLength = bitLength;
+          shade->sendCommand(command, repeats);
+          server.send(200, _encoding_json, F("{\"status\":\"SUCCESS\",\"desc\":\"Command Sent\"}"));
+          return;
+        }
+      }
+      for(uint8_t i = 0; i < SOMFY_MAX_GROUPS; i++) {
+        SomfyGroup *group = &somfy.groups[i];
+        if(group->getGroupId() != 255 && group->getRemoteAddress() == address) {
+          if(bitLength) group->bitLength = bitLength;
+          group->sendCommand(command, repeats);
+          server.send(200, _encoding_json, F("{\"status\":\"SUCCESS\",\"desc\":\"Command Sent\"}"));
+          return;
+        }
+      }
+      // Orphan / unknown Remote ID — still transmit using NVS rolling code for that address.
+      SomfyRemote remote;
+      remote.setRemoteAddress(address);
+      remote.bitLength = bitLength ? bitLength : somfy.transceiver.config.type;
+      remote.proto = static_cast<radio_proto>(proto);
+      if(hasRcode && rcode > 0) remote.setRollingCode(rcode);
+      if(encKey) {
+        // Legacy path kept for callers that supply a full frame; otherwise Remote::sendCommand sets encKey.
+      }
+      remote.sendCommand(command, repeats);
+      server.send(200, _encoding_json, F("{\"status\":\"SUCCESS\",\"desc\":\"Command Sent\"}"));
     }
     });
   server.on("/setgeneral", []() {
@@ -2408,17 +2909,21 @@ void Web::begin() {
       HTTPMethod method = server.method();
       if (method == HTTP_POST || method == HTTP_PUT) {
         // Parse out all the inputs.
-        if (obj.containsKey("hostname") || obj.containsKey("ssdpBroadcast") || obj.containsKey("checkForUpdate")) {
+        if (obj.containsKey("hostname") || obj.containsKey("ssdpBroadcast") || obj.containsKey("checkForUpdate") || obj.containsKey("autoInstallUpdate") || obj.containsKey("alexaHueEnabled")) {
           bool checkForUpdate = settings.checkForUpdate;
+          bool alexaWas = settings.alexaHueEnabled;
           settings.fromJSON(obj);
           settings.save();
           if(settings.checkForUpdate != checkForUpdate) git.emitUpdateCheck();
           if(obj.containsKey("hostname")) net.updateHostname();
+          if(settings.alexaHueEnabled != alexaWas || obj.containsKey("alexaHueEnabled"))
+            alexaHue.applySettings();
         }
-        if (obj.containsKey("ntpServer") || obj.containsKey("ntpServer")) {
+        if (obj.containsKey("ntpServer") || obj.containsKey("posixZone")) {
           settings.NTP.fromJSON(obj);
           settings.NTP.save();
         }
+        if(mesh.isRouter()) mesh.syncSettingsToPeers();
         server.send(200, "application/json", "{\"status\":\"OK\",\"desc\":\"Successfully set General Settings\"}");
       }
       else {
@@ -2555,22 +3060,14 @@ void Web::begin() {
     resp.beginResponse(&server, g_content, sizeof(g_content));
     resp.beginObject();
     resp.addElem("fwVersion", settings.fwVersion.name);
+    resp.addElem("appVersion", settings.appVersion.name);
     settings.toJSON(resp);
     settings.NTP.toJSON(resp);
+    resp.addElem("alexaHueCount", alexaHue.exposedCount());
+    resp.addElem("alexaHueMax", alexaHue.maxDevices());
     resp.endObject();
     resp.endResponse();
-    /*
-    DynamicJsonDocument doc(512);
-    JsonObject obj = doc.to<JsonObject>();
-    doc["fwVersion"] = settings.fwVersion.name;
-    settings.toJSON(obj);
-    //settings.Ethernet.toJSON(obj);
-    //settings.WIFI.toJSON(obj);
-    settings.NTP.toJSON(obj);
-    serializeJson(doc, g_content);
-    server.send(200, _encoding_json, g_content);
-    */
-    });
+        });
   server.on("/networksettings", []() {
     webServer.sendCORSHeaders(server);
     JsonResponse resp;
@@ -2590,21 +3087,7 @@ void Web::begin() {
     resp.endObject();
     resp.endResponse();
     
-    /*
-    DynamicJsonDocument doc(2048);
-    JsonObject obj = doc.to<JsonObject>();
-    doc["fwVersion"] = settings.fwVersion.name;
-    settings.toJSON(obj);
-    JsonObject eth = obj.createNestedObject("ethernet");
-    settings.Ethernet.toJSON(eth);
-    JsonObject wifi = obj.createNestedObject("wifi");
-    settings.WIFI.toJSON(wifi);
-    JsonObject ip = obj.createNestedObject("ip");
-    settings.IP.toJSON(ip);
-    serializeJson(doc, g_content);
-    server.send(200, _encoding_json, g_content);
-    */
-    });
+        });
   server.on("/connectmqtt", []() {
     if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
     DynamicJsonDocument doc(1024);
@@ -2629,14 +3112,7 @@ void Web::begin() {
         settings.MQTT.toJSON(resp);
         resp.endObject();
         resp.endResponse();
-        /*
-        DynamicJsonDocument sdoc(1024);
-        JsonObject sobj = sdoc.to<JsonObject>();
-        settings.MQTT.toJSON(sobj);
-        serializeJson(sdoc, g_content);
-        server.send(200, _encoding_json, g_content);
-        */
-      }
+              }
       else {
         server.send(201, "application/json", "{\"status\":\"ERROR\",\"desc\":\"Invalid HTTP Method: \"}");
       }
@@ -2651,14 +3127,7 @@ void Web::begin() {
     resp.endObject();
     resp.endResponse();
     
-    /*
-    DynamicJsonDocument doc(1024);
-    JsonObject obj = doc.to<JsonObject>();
-    settings.MQTT.toJSON(obj);
-    serializeJson(doc, g_content);
-    server.send(200, _encoding_json, g_content);
-    */
-    });
+        });
   server.on("/roomSortOrder", []() {
     if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
     DynamicJsonDocument doc(512);
@@ -2683,6 +3152,7 @@ void Web::begin() {
             if(room) room->sortOrder = order++;
           }
         }
+        somfy.commit();
         server.send(200, "application/json", "{\"status\":\"OK\",\"desc\":\"Successfully set room order\"}");
       }
       else {
@@ -2714,6 +3184,7 @@ void Web::begin() {
             if(shade) shade->sortOrder = order++;
           }
         }
+        somfy.commit();
         server.send(200, "application/json", "{\"status\":\"OK\",\"desc\":\"Successfully set shade order\"}");
       }
       else {
@@ -2745,6 +3216,7 @@ void Web::begin() {
             if(group) group->sortOrder = order++;
           }
         }
+        somfy.commit();
         server.send(200, "application/json", "{\"status\":\"OK\",\"desc\":\"Successfully set group order\"}");
       }
       else {
@@ -2761,14 +3233,7 @@ void Web::begin() {
     somfy.transceiver.toJSON(resp);
     resp.endObject();
     resp.endResponse();
-    /*
-    DynamicJsonDocument doc(1024);
-    JsonObject obj = doc.to<JsonObject>();
-    somfy.transceiver.toJSON(obj);
-    serializeJson(doc, g_content);
-    server.send(200, _encoding_json, g_content);
-    */
-  });
+      });
   server.on("/endFrequencyScan", []() {
     webServer.sendCORSHeaders(server);
     somfy.transceiver.endFrequencyScan();
@@ -2778,14 +3243,7 @@ void Web::begin() {
     somfy.transceiver.toJSON(resp);
     resp.endObject();
     resp.endResponse();
-    /*
-    DynamicJsonDocument doc(1024);
-    JsonObject obj = doc.to<JsonObject>();
-    somfy.transceiver.toJSON(obj);
-    serializeJson(doc, g_content);
-    server.send(200, _encoding_json, g_content);
-    */
-  });
+      });
   server.on("/recoverFilesystem", [] () {
     if(server.method() == HTTP_OPTIONS) { server.send(200, "OK"); return; }
     webServer.sendCORSHeaders(server);
@@ -2800,4 +3258,5 @@ void Web::begin() {
   });
   server.begin();
   apiServer.begin();
+  alexaHue.begin(&server);
 }

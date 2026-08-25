@@ -1,30 +1,14 @@
+/**
+ * Utils.h — Utility declarations and debug Serial alias.
+ */
+
 #ifndef utils_h
 #define utils_h
 #include <Arduino.h>
 
-
 #define DEBUG_SOMFY Serial
 
-
-
-
 [[maybe_unused]] static void SETCHARPROP(char *prop, const char *value, size_t size) {strncpy(prop, value, size); prop[size - 1] = '\0';}
-/*
-namespace util { 
-  // Createa a custom to_string function.  C++ can be annoying
-  // with all the trailing 0s on number formats.
-  template <typename T> std::string to_string(const T& t) {
-    std::string str{std::to_string (t)};
-    int offset{1};
-    if (str.find_last_not_of('0') == str.find('.')) {
-      offset = 0;     
-    }
-    str.erase ( str.find_last_not_of('0') + 1, std::string::npos ); 
-    str.erase ( str.find_last_not_of('.') + 1, std::string::npos );    
-    return str; 
-  } 
-}
-*/
 
 static void _ltrim(char *str) {
   int s = 0, j, k = 0;

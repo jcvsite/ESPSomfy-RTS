@@ -1,7 +1,12 @@
+/**
+ * SomfyController.ino — Main Arduino entry: setup/loop, WDT, OTA lock, and subsystem dispatch.
+ */
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <LittleFS.h>
 #include <esp_task_wdt.h>
+#include <esp_ota_ops.h>
 #include "ConfigSettings.h"
 #include "Network.h"
 #include "Web.h"
@@ -11,6 +16,10 @@
 #include "MQTT.h"
 #include "GitOTA.h"
 #include "Recovery.h"
+#include "FixedCode.h"
+#include "Mesh.h"
+#include "Automation.h"
+#include <Update.h>
 
 ConfigSettings settings;
 Web webServer;
@@ -30,6 +39,21 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
   Serial.println("Startup/Boot....");
+  // Must run before any init that might reboot/crash. With
+  // CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE, a PENDING_VERIFY image rolls back
+  // on the next reset unless marked valid — late mark-valid after net.setup()
+  // made OTA appear to succeed then silently return to the previous FW.
+  {
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t st;
+    if(running && esp_ota_get_state_partition(running, &st) == ESP_OK &&
+       st == ESP_OTA_IMG_PENDING_VERIFY) {
+      if(esp_ota_mark_app_valid_cancel_rollback() == ESP_OK)
+        Serial.println(F("OTA image marked valid (rollback cancelled)"));
+      else
+        Serial.println(F("OTA mark-valid failed"));
+    }
+  }
   handlePowerCycleReset();
   Serial.println("Mounting File System...");
   if(LittleFS.begin()) Serial.println("File system mounted successfully");
@@ -45,6 +69,10 @@ void setup() {
   delay(1000);
   net.setup();
   somfy.begin();
+  mesh.begin();
+  fixedCodes.begin();
+  automation = new AutomationController();
+  if(automation) automation->begin();
   esp_task_wdt_init(15, true); //enable panic so ESP32 restarts
   esp_task_wdt_add(NULL); //add current thread to WDT watch
 
@@ -61,16 +89,19 @@ void loop() {
     ESP.restart();
     return;
   }
-  uint32_t timing = millis();
-
   net.loop();
-  if(millis() - timing > 100) Serial.printf("Timing Net: %ldms\n", millis() - timing);
-  timing = millis();
   esp_task_wdt_reset();
-  somfy.loop();
-  if(millis() - timing > 100) Serial.printf("Timing Somfy: %ldms\n", millis() - timing);
-  timing = millis();
-  esp_task_wdt_reset();
+  // Do not pump RF / FS writers while an OTA flash is in progress.
+  if(!Update.isRunning() && !git.lockFS) {
+    somfy.loop();
+    esp_task_wdt_reset();
+    mesh.loop();
+    esp_task_wdt_reset();
+    fixedCodes.loop();
+    esp_task_wdt_reset();
+    if(automation) automation->loop();
+    esp_task_wdt_reset();
+  }
   if(net.connected() || net.softAPOpened) {
     if(!rebootDelay.reboot && net.connected() && !net.softAPOpened) {
       git.loop();
@@ -78,13 +109,8 @@ void loop() {
     }
     webServer.loop();
     esp_task_wdt_reset();
-    if(millis() - timing > 100) Serial.printf("Timing WebServer: %ldms\n", millis() - timing);
-    esp_task_wdt_reset();
-    timing = millis();
     sockEmit.loop();
-    if(millis() - timing > 100) Serial.printf("Timing Socket: %ldms\n", millis() - timing);
     esp_task_wdt_reset();
-    timing = millis();
   }
   if(rebootDelay.reboot && millis() > rebootDelay.rebootTime) {
     net.end();

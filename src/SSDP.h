@@ -1,3 +1,7 @@
+/**
+ * SSDP.h — SSDP device descriptors and send helpers.
+ */
+
 #ifndef SSDP_h
 #define SSDP_h
 #include <Arduino.h>
@@ -113,8 +117,7 @@ class SSDPClass {
   protected:
     ssdp_response_t sendQueue[SSDP_QUEUE_SIZE];
     //ssdp_response_t sendQueue[SSDP_QUEUE_SIZE];
-    //void _send(ssdp_method_t method, UPNPDeviceType *dev, bool useUUID);
-    //void _sendAll(ssdp_method_t method, bool useUUID);
+
     void _startTimer();
     void _stopTimer();
     void _sendNotify();
@@ -159,6 +162,8 @@ class SSDPClass {
     void setInterval(uint32_t interval);
     void schema(WiFiClient client) { schema((Print&)std::ref(client)); }
     void schema(Print &print);
+    /** Send a raw SSDP/UDP reply (used by Alexa Hue discovery). */
+    void writeRaw(IPAddress addr, uint16_t port, const char *msg) { _sendResponse(addr, port, msg); }
 
     void setDeviceType(uint8_t ndx, UPNPDeviceType *dt);
     void setDeviceType(uint8_t ndx, const String& type) { setDeviceType(ndx, type.c_str()); }

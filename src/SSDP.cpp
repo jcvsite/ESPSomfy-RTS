@@ -1,9 +1,13 @@
+/**
+ * SSDP.cpp — UPnP/SSDP advertisements for network discovery.
+ */
+
 #include <functional>
 #include <AsyncUDP.h>
 #include "Utils.h"
 #include "ConfigSettings.h"
 #include "SSDP.h"
-
+#include "AlexaHue.h"
 
 #define SSDP_PORT         1900
 #define SSDP_METHOD_SIZE  10
@@ -13,6 +17,7 @@
 //#define DEBUG_SSDP Serial
 //#define DEBUG_SSDP_PACKET Serial
 extern ConfigSettings settings;
+#include "NoLog.h"
 
 static const char _ssdp_uuid_template[] PROGMEM = "C2496952-5610-47E6-A968-2FC1%02X%02X%02X%02X";
 static const char _ssdp_serial_number_template[] PROGMEM = "ESP32-%02x%02x%02x";
@@ -75,7 +80,6 @@ static const char _ssdp_schema_template[] PROGMEM =
   "<minor>0</minor>"
   "</specVersion>"
   "<URLBase>http://%s:%u/</URLBase>";    // WiFi.localIP(), _port
-
 
 UPNPDeviceType::UPNPDeviceType() {
     lastNotified = 0;
@@ -446,18 +450,6 @@ void SSDPClass::_sendNotify() {
         #endif
         this->_sendNotify(dev, i == 0);
       }
-      else {
-        /*
-        #ifdef DEBUG_SSDP
-        DEBUG_SSDP.print(dev->deviceType);
-        DEBUG_SSDP.print(" Time since last notified: ");
-        DEBUG_SSDP.print(elapsed/1000);
-        DEBUG_SSDP.print("sec ");
-        DEBUG_SSDP.print(this->_interval);
-        DEBUG_SSDP.println("sec -- SKIPPING");
-        #endif
-        */
-      }
     }
   }
 }
@@ -686,6 +678,7 @@ void SSDPClass::_processRequest(AsyncUDPPacket &p) {
   ssdp_packet_t pkt;
   this->_parsePacket(&pkt, p);
   if(pkt.valid && pkt.method == SEARCH) {
+    alexaHue.onSsdpSearch(p, pkt.st);
     // Check to see if we have anything to respond to from this packet.
     if(strcmp("ssdp:all", pkt.st) == 0) {
       #ifdef DEBUG_SSDP

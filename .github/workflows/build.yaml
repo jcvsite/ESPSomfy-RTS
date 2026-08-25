@@ -42,6 +42,12 @@ jobs:
       - name: Rename LittleFS to Standard Name
         run: cp .pio/build/esp32dev/littlefs.bin SomfyController.littlefs.bin
 
+      - name: Versioned LittleFS name
+        if: github.event_name == 'release'
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          cp SomfyController.littlefs.bin "SomfyController.littlefs-${TAG}.bin"
+
       # Sauvegarde temporaire du LittleFS pour le job suivant (firmwares)
       - name: Upload LittleFS Artifact
         uses: actions/upload-artifact@v4
@@ -50,8 +56,18 @@ jobs:
           path: SomfyController.littlefs.bin
           retention-days: 5
 
-      # Upload du LittleFS UNIQUE sur la page de la Release
-      - name: Upload LittleFS to Release
+      # Upload versioned LittleFS (primary) + legacy unversioned alias
+      - name: Upload LittleFS to Release (versioned)
+        if: github.event_name == 'release'
+        uses: shogo82148/actions-upload-release-asset@v1.7.5
+        with:
+          github_token: ${{ github.token }}
+          upload_url: ${{ steps.get_release.outputs.upload_url }}
+          asset_name: SomfyController.littlefs-${{ github.event.release.tag_name }}.bin
+          asset_path: SomfyController.littlefs-${{ github.event.release.tag_name }}.bin
+          overwrite: true
+
+      - name: Upload LittleFS to Release (legacy)
         if: github.event_name == 'release'
         uses: shogo82148/actions-upload-release-asset@v1.7.5
         with:
@@ -78,42 +94,60 @@ jobs:
             name: ESP32
             chip: ESP32
             addr_bootloader: "0x1000"
+            addr_fs: "0x390000"
+            fs_bin: SomfyController.littlefs.bin
             fwname: SomfyController.ino.esp32.bin
             obname: SomfyController.onboard.esp32.bin
+            pack: SomfyController.esp32.espsomfy
           - env: esp32wrover
             name: ESP32-Wrover
             chip: ESP32
             addr_bootloader: "0x1000"
+            addr_fs: "0x390000"
+            fs_bin: SomfyController.littlefs.bin
             fwname: SomfyController.ino.esp32wrover.bin
             obname: SomfyController.onboard.esp32wrover.bin
+            pack: SomfyController.esp32wrover.espsomfy
           - env: esp32c3
             name: ESP32C3
             chip: ESP32-C3
             addr_bootloader: "0x0"
+            addr_fs: "0x390000"
+            fs_bin: SomfyController.littlefs.bin
             fwname: SomfyController.ino.esp32c3.bin
             obname: SomfyController.onboard.esp32c3.bin
+            pack: SomfyController.esp32c3.espsomfy
           - env: esp32s2
             name: ESP32S2
             chip: ESP32-S2
             addr_bootloader: "0x1000"
+            addr_fs: "0x390000"
+            fs_bin: SomfyController.littlefs.bin
             fwname: SomfyController.ino.esp32s2.bin
             obname: SomfyController.onboard.esp32s2.bin
+            pack: SomfyController.esp32s2.espsomfy
 
           # VERSION ESP32-S3 (4MB - Universelle)
           - env: esp32s3_4mb
             name: ESP32S3_4MB
             chip: ESP32-S3
             addr_bootloader: "0x0"
+            addr_fs: "0x390000"
+            fs_bin: SomfyController.littlefs.bin
             fwname: SomfyController.ino.esp32s3_4mb.bin
             obname: SomfyController.onboard.esp32s3_4mb.bin
+            pack: SomfyController.esp32s3_4mb.espsomfy
 
           # VERSION ESP32-S3 (8MB - Spécifique)
           - env: esp32s3_8mb
             name: ESP32S3_8MB
             chip: ESP32-S3
             addr_bootloader: "0x0"
+            addr_fs: "0x610000"
+            fs_bin: .pio/build/esp32s3_8mb/SomfyController.littlefs.bin
             fwname: SomfyController.ino.esp32s3_8mb.bin
             obname: SomfyController.onboard.esp32s3_8mb.bin
+            pack: SomfyController.esp32s3_8mb.espsomfy
 
     steps:
       - name: Get Release info
@@ -132,6 +166,12 @@ jobs:
         with:
           name: LittleFS
 
+      - name: Stage LittleFS for .espsomfy packer
+        if: matrix.env != 'esp32s3_8mb'
+        run: |
+          mkdir -p .pio/build/${{ matrix.env }}
+          cp SomfyController.littlefs.bin .pio/build/${{ matrix.env }}/SomfyController.littlefs.bin
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -143,6 +183,10 @@ jobs:
       - name: Build firmware
         run: pio run -e ${{ matrix.env }}
 
+      - name: Build LittleFS (8MB partition)
+        if: matrix.env == 'esp32s3_8mb'
+        run: pio run -e ${{ matrix.env }} -t buildfs
+
       # Création de l'image de fusion onboard
       - name: ${{ matrix.name }} Image
         run: |
@@ -151,7 +195,7 @@ jobs:
             ${{ matrix.addr_bootloader }} .pio/build/${{ matrix.env }}/bootloader.bin \
             0x8000 .pio/build/${{ matrix.env }}/partitions.bin \
             0x10000 .pio/build/${{ matrix.env }}/firmware.bin \
-            0x290000 SomfyController.littlefs.bin
+            ${{ matrix.addr_fs }} ${{ matrix.fs_bin }}
 
       # Compression de l'image onboard avec son nom d'archive propre
       - name: Compress onboard image
@@ -170,8 +214,54 @@ jobs:
             .pio/build/${{ matrix.env }}/SomfyController.onboard.bin
           retention-days: 5
 
-      # CAS 2 : Si c'est une RELEASE (Firmware applicatif)
-      - name: Upload firmware to Release
+      # CAS 2 : RELEASE uploads — versioned primary names + legacy unversioned aliases
+      - name: Stage versioned release assets
+        if: github.event_name == 'release'
+        id: ver_assets
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          BUILD: .pio/build/${{ matrix.env }}
+          BASE_FW: ${{ matrix.fwname }}
+          BASE_PACK: ${{ matrix.pack }}
+          BASE_OB: ${{ matrix.obname }}.zip
+        run: |
+          set -e
+          cp "$BUILD/firmware.bin" "$BUILD/$BASE_FW"
+          python3 <<'PY'
+          import os, shutil
+          tag = os.environ["TAG"]
+          build = os.environ["BUILD"]
+          def versioned(name: str) -> str:
+              if name.endswith(".bin.zip"):
+                  return name[:-8] + f"-{tag}.bin.zip"
+              stem, ext = os.path.splitext(name)
+              return f"{stem}-{tag}{ext}"
+          mapping = {}
+          for key, base in [("fw", os.environ["BASE_FW"]), ("pack", os.environ["BASE_PACK"]), ("ob", os.environ["BASE_OB"])]:
+              src = os.path.join(build, base)
+              if not os.path.isfile(src):
+                  raise SystemExit(f"missing asset: {src}")
+              dst_name = versioned(base)
+              dst = os.path.join(build, dst_name)
+              shutil.copy2(src, dst)
+              mapping[key] = dst_name
+              print(f"versioned: {dst_name}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out:
+              for key, name in mapping.items():
+                  out.write(f"{key}={name}\n")
+          PY
+
+      - name: Upload firmware to Release (versioned)
+        if: github.event_name == 'release'
+        uses: shogo82148/actions-upload-release-asset@v1.7.5
+        with:
+          github_token: ${{ github.token }}
+          upload_url: ${{ steps.get_release.outputs.upload_url }}
+          asset_name: ${{ steps.ver_assets.outputs.fw }}
+          asset_path: .pio/build/${{ matrix.env }}/${{ steps.ver_assets.outputs.fw }}
+          overwrite: true
+
+      - name: Upload firmware to Release (legacy)
         if: github.event_name == 'release'
         uses: shogo82148/actions-upload-release-asset@v1.7.5
         with:
@@ -181,8 +271,38 @@ jobs:
           asset_path: .pio/build/${{ matrix.env }}/firmware.bin
           overwrite: true
 
-      # CAS 2 suite : Si c'est une RELEASE (Image zip d'usine)
-      - name: Upload onboard image to Release
+      - name: Upload .espsomfy pack to Release (versioned)
+        if: github.event_name == 'release'
+        uses: shogo82148/actions-upload-release-asset@v1.7.5
+        with:
+          github_token: ${{ github.token }}
+          upload_url: ${{ steps.get_release.outputs.upload_url }}
+          asset_name: ${{ steps.ver_assets.outputs.pack }}
+          asset_path: .pio/build/${{ matrix.env }}/${{ steps.ver_assets.outputs.pack }}
+          overwrite: true
+
+      - name: Upload .espsomfy pack to Release (legacy)
+        if: github.event_name == 'release'
+        uses: shogo82148/actions-upload-release-asset@v1.7.5
+        with:
+          github_token: ${{ github.token }}
+          upload_url: ${{ steps.get_release.outputs.upload_url }}
+          asset_name: ${{ matrix.pack }}
+          asset_path: .pio/build/${{ matrix.env }}/${{ matrix.pack }}
+          overwrite: true
+
+      - name: Upload onboard image to Release (versioned)
+        if: github.event_name == 'release'
+        uses: shogo82148/actions-upload-release-asset@v1.7.5
+        with:
+          github_token: ${{ github.token }}
+          upload_url: ${{ steps.get_release.outputs.upload_url }}
+          asset_name: ${{ steps.ver_assets.outputs.ob }}
+          asset_path: .pio/build/${{ matrix.env }}/${{ steps.ver_assets.outputs.ob }}
+          overwrite: true
+          asset_content_type: application/zip
+
+      - name: Upload onboard image to Release (legacy)
         if: github.event_name == 'release'
         uses: shogo82148/actions-upload-release-asset@v1.7.5
         with:
