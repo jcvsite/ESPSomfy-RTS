@@ -1,67 +1,62 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="920" height="420" viewBox="0 0 920 420" role="img" aria-label="Which flash method to use">
-  <defs>
-    <style>
-      .title { font: 700 22px Segoe UI, Helvetica, Arial, sans-serif; fill: #1a2332; }
-      .label { font: 600 14px Segoe UI, Helvetica, Arial, sans-serif; fill: #1a2332; }
-      .sub { font: 400 12px Segoe UI, Helvetica, Arial, sans-serif; fill: #5a6575; }
-      .chip { font: 700 11px Segoe UI, Helvetica, Arial, sans-serif; fill: #fff; }
-      .arrow { stroke: #8a96a8; stroke-width: 2; fill: none; marker-end: url(#m); }
-    </style>
-    <marker id="m" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
-      <path d="M0,0 L6,3 L0,6 Z" fill="#8a96a8"/>
-    </marker>
-  </defs>
-
   <rect width="920" height="420" rx="20" fill="#f4f7fb"/>
-  <text x="40" y="48" class="title">Which install path?</text>
-  <text x="40" y="72" class="sub">Pick one  do not mix web OTA with a first-time flash from another firmware.</text>
+
+  <text x="40" y="48" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#1a2332">Which install path?</text>
+  <text x="40" y="72" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#5a6575">Pick one — do not mix web OTA with a first-time flash from another firmware.</text>
 
   <!-- Start -->
-  <rect x="40" y="100" width="200" height="72" rx="14" fill="#fff" stroke="#d5dde8"/>
-  <text x="60" y="132" class="label">What is on the board?</text>
-  <text x="60" y="154" class="sub">Blank / other fork / this fork</text>
+  <rect x="40" y="100" width="200" height="72" rx="14" fill="#ffffff" stroke="#d5dde8" stroke-width="1.5"/>
+  <text x="60" y="132" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700" fill="#1a2332">What is on the board?</text>
+  <text x="60" y="154" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#5a6575">Blank / other fork / this fork</text>
 
-  <path class="arrow" d="M250 136 H300"/>
+  <!-- Arrows (simple lines + triangles, no markers) -->
+  <line x1="250" y1="136" x2="300" y2="136" stroke="#8a96a8" stroke-width="2"/>
+  <polygon points="300,130 310,136 300,142" fill="#8a96a8"/>
 
-  <!-- Three paths -->
-  <rect x="310" y="40" width="250" height="100" rx="14" fill="#e8f5ee" stroke="#9fd0b4"/>
-  <rect x="310" y="40" width="72" height="24" rx="8" fill="#2f9e62"/>
-  <text x="322" y="57" class="chip">NEW</text>
-  <text x="330" y="90" class="label">Blank / new ESP32</text>
-  <text x="330" y="112" class="sub">USB + onboard .bin.zip</text>
-  <text x="330" y="128" class="sub">ESPHome Web (recommended)</text>
+  <line x1="560" y1="90" x2="600" y2="90" stroke="#8a96a8" stroke-width="2"/>
+  <polygon points="600,84 610,90 600,96" fill="#8a96a8"/>
+  <line x1="560" y1="210" x2="600" y2="210" stroke="#8a96a8" stroke-width="2"/>
+  <polygon points="600,204 610,210 600,216" fill="#8a96a8"/>
+  <line x1="560" y1="330" x2="600" y2="330" stroke="#8a96a8" stroke-width="2"/>
+  <polygon points="600,324 610,330 600,336" fill="#8a96a8"/>
 
-  <rect x="310" y="160" width="250" height="100" rx="14" fill="#fff4e8" stroke="#e2c49a"/>
-  <rect x="310" y="160" width="96" height="24" rx="8" fill="#c47a22"/>
-  <text x="322" y="177" class="chip">MIGRATE</text>
-  <text x="330" y="210" class="label">rstrouse / other fork</text>
-  <text x="330" y="232" class="sub">Backup ’ USB once ’ Restore</text>
-  <text x="330" y="248" class="sub">Web OTA cannot change map</text>
+  <!-- NEW -->
+  <rect x="310" y="40" width="250" height="100" rx="14" fill="#e8f5ee" stroke="#9fd0b4" stroke-width="1.5"/>
+  <rect x="322" y="52" width="52" height="22" rx="8" fill="#2f9e62"/>
+  <text x="334" y="68" font-family="Arial, Helvetica, sans-serif" font-size="11" font-weight="700" fill="#ffffff">NEW</text>
+  <text x="330" y="96" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700" fill="#1a2332">Blank / new ESP32</text>
+  <text x="330" y="116" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#5a6575">USB + onboard .bin.zip</text>
+  <text x="330" y="134" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#5a6575">ESPHome Web (recommended)</text>
 
-  <rect x="310" y="280" width="250" height="100" rx="14" fill="#eaf0ff" stroke="#a8bae8"/>
-  <rect x="310" y="280" width="88" height="24" rx="8" fill="#3b6fd8"/>
-  <text x="322" y="297" class="chip">UPDATE</text>
-  <text x="330" y="330" class="label">Already on this fork</text>
-  <text x="330" y="352" class="sub">Web Manual Update</text>
-  <text x="330" y="368" class="sub">.espsomfy package only</text>
+  <!-- MIGRATE -->
+  <rect x="310" y="160" width="250" height="100" rx="14" fill="#fff4e8" stroke="#e2c49a" stroke-width="1.5"/>
+  <rect x="322" y="172" width="72" height="22" rx="8" fill="#c47a22"/>
+  <text x="332" y="188" font-family="Arial, Helvetica, sans-serif" font-size="11" font-weight="700" fill="#ffffff">MIGRATE</text>
+  <text x="330" y="216" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700" fill="#1a2332">rstrouse / other fork</text>
+  <text x="330" y="236" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#5a6575">Backup ? USB once ? Restore</text>
+  <text x="330" y="254" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#5a6575">Web OTA cannot change map</text>
 
-  <path class="arrow" d="M560 90 H610"/>
-  <path class="arrow" d="M560 210 H610"/>
-  <path class="arrow" d="M560 330 H610"/>
+  <!-- UPDATE -->
+  <rect x="310" y="280" width="250" height="100" rx="14" fill="#eaf0ff" stroke="#a8bae8" stroke-width="1.5"/>
+  <rect x="322" y="292" width="64" height="22" rx="8" fill="#3b6fd8"/>
+  <text x="332" y="308" font-family="Arial, Helvetica, sans-serif" font-size="11" font-weight="700" fill="#ffffff">UPDATE</text>
+  <text x="330" y="336" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700" fill="#1a2332">Already on this fork</text>
+  <text x="330" y="356" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#5a6575">Web Manual Update</text>
+  <text x="330" y="374" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#5a6575">.espsomfy package only</text>
 
   <!-- Outcomes -->
-  <rect x="610" y="40" width="270" height="100" rx="14" fill="#fff" stroke="#d5dde8"/>
-  <text x="630" y="78" class="label">SomfyController.onboard</text>
-  <text x="630" y="100" class="label">.esp32-vX.Y.Z.bin.zip</text>
-  <text x="630" y="122" class="sub">Full image: boot + map + FW + FS</text>
+  <rect x="610" y="40" width="270" height="100" rx="14" fill="#ffffff" stroke="#d5dde8" stroke-width="1.5"/>
+  <text x="630" y="78" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700" fill="#1a2332">SomfyController.onboard</text>
+  <text x="630" y="100" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700" fill="#1a2332">.esp32-vX.Y.Z.bin.zip</text>
+  <text x="630" y="122" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#5a6575">Full image: boot + map + FW + FS</text>
 
-  <rect x="610" y="160" width="270" height="100" rx="14" fill="#fff" stroke="#d5dde8"/>
-  <text x="630" y="198" class="label">Same onboard zip (USB)</text>
-  <text x="630" y="220" class="sub">Then Restore .backup in web UI</text>
-  <text x="630" y="242" class="sub">WiFi can survive (no full erase)</text>
+  <rect x="610" y="160" width="270" height="100" rx="14" fill="#ffffff" stroke="#d5dde8" stroke-width="1.5"/>
+  <text x="630" y="198" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700" fill="#1a2332">Same onboard zip (USB)</text>
+  <text x="630" y="220" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#5a6575">Then Restore .backup in web UI</text>
+  <text x="630" y="242" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#5a6575">Wi-Fi can survive (no full erase)</text>
 
-  <rect x="610" y="280" width="270" height="100" rx="14" fill="#fff" stroke="#d5dde8"/>
-  <text x="630" y="318" class="label">SomfyController.esp32</text>
-  <text x="630" y="340" class="label">-vX.Y.Z.espsomfy</text>
-  <text x="630" y="362" class="sub">Never use onboard.zip here</text>
+  <rect x="610" y="280" width="270" height="100" rx="14" fill="#ffffff" stroke="#d5dde8" stroke-width="1.5"/>
+  <text x="630" y="318" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700" fill="#1a2332">SomfyController.esp32</text>
+  <text x="630" y="340" font-family="Arial, Helvetica, sans-serif" font-size="14" font-weight="700" fill="#1a2332">-vX.Y.Z.espsomfy</text>
+  <text x="630" y="362" font-family="Arial, Helvetica, sans-serif" font-size="12" fill="#5a6575">Never use onboard.zip here</text>
 </svg>

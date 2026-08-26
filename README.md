@@ -20,7 +20,7 @@ Community fork of [rstrouse/ESPSomfy-RTS](https://github.com/rstrouse/ESPSomfy-R
 | **Coming from rstrouse / another fork** | [Migrate once over USB](#migrate-from-another-firmware) (Backup → flash → Restore) |
 | **Already on this fork (v3)** | [Update over Wi‑Fi](#update-on-this-fork-wi-fi) (`.espsomfy` only) |
 
-![Which flash path to use](images/flash-path.svg)
+![Which flash path to use](images/flash-path.png)
 
 Hardware wiring and Somfy pairing are unchanged — see the [original wiki](https://github.com/rstrouse/ESPSomfy-RTS/wiki).
 
