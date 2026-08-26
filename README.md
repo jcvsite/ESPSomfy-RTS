@@ -1,176 +1,213 @@
 # ESPSomfy-RTS
 
-Fork of [rstrouse/ESPSomfy-RTS](https://github.com/rstrouse/ESPSomfy-RTS) (v2.4.7), aimed at **large villas and multi-building homes**: dozens of motors, several rooms, and RF coverage beyond a single ESP32. Same ESP32 + CC1101 hardware for Somfy RTS / RTW / RTV 433 MHz.
+Community fork of [rstrouse/ESPSomfy-RTS](https://github.com/rstrouse/ESPSomfy-RTS) for **large homes**: more shades, mesh radios, scenes, and a modern web UI.
 
-This tree adds mesh radios (Router + Repeaters), **48 shades / 24 rooms**, scenes and schedules, fleet OTA, a redesigned Settings/Home UI (ships **English**; additional UI languages are possible via locale files), motor-control fixes, and selected bug fixes from other community forks.
+[![GitHub Release](https://img.shields.io/github/v/release/jcvsite/ESPSomfy-RTS?style=for-the-badge&label=Firmware)](https://github.com/jcvsite/ESPSomfy-RTS/releases)
+[![HA Integration](https://img.shields.io/github/v/release/jcvsite/ESPSomfy-RTS-HA?style=for-the-badge&label=Home%20Assistant)](https://github.com/jcvsite/ESPSomfy-RTS-HA/releases)
+[![License](https://img.shields.io/github/license/jcvsite/ESPSomfy-RTS?style=for-the-badge)](LICENSE)
 
-Web UI: **English** in this release (multi-language locale packs can be added later). The matching Home Assistant integration already ships **multiple translations**. Hardware build, pairing, and MQTT: [original wiki](https://github.com/rstrouse/ESPSomfy-RTS/wiki). Release notes: [CHANGELOG.md](CHANGELOG.md).
+**Current:** firmware **v3.4.5** · board `esp32dev` (4 MB) · [CHANGELOG](CHANGELOG.md) · [HA integration v2.6.1](https://github.com/jcvsite/ESPSomfy-RTS-HA)
 
-[![GitHub Release](https://img.shields.io/github/release/jcvsite/ESPSomfy-RTS.svg?style=for-the-badge)](https://github.com/jcvsite/ESPSomfy-RTS/releases)
-[![License](https://img.shields.io/github/license/jcvsite/ESPSomfy-RTS.svg?style=for-the-badge)](LICENSE)
+> **Important:** This fork uses a **new flash layout**. First install is always **USB**. You cannot jump here with web Manual Update / GitHub OTA from the original or other community firmwares.
 
-**Firmware v3.4.5** · target `esp32dev` (4 MB OTA partition map) · **SmartRC-CC1101 Driver Lib 3.0.2** (latest; fallback env for 2.5.7 available)
+---
 
-> **First install requires a USB / full flash.** This release uses a different partition table than the original firmware and other forks. You **cannot** install or upgrade to it via web Manual Update / GitHub OTA from rstrouse, xkain, or other community builds — that would brick or leave an inconsistent flash map. Shade config is not lost if you use Backup/Restore: export a `.backup` first, USB-flash once, then **import the backup** on the new firmware. After that, use web `.espsomfy` only between builds of **this** fork.
+## Quick start
 
-### Architecture (original vs this fork)
+| Your situation | What to do |
+|---|---|
+| **New / blank ESP32** | [Flash a new device](#flash-a-new-device) (USB + onboard zip) |
+| **Coming from rstrouse / another fork** | [Migrate once over USB](#migrate-from-another-firmware) (Backup → flash → Restore) |
+| **Already on this fork (v3)** | [Update over Wi‑Fi](#update-on-this-fork-wi-fi) (`.espsomfy` only) |
 
-![ESPSomfy-RTS architecture vs the original](images/espsomfy-architecture-vs-original.png)
+![Which flash path to use](images/flash-path.svg)
 
-### Features (original vs this fork)
+Hardware wiring and Somfy pairing are unchanged — see the [original wiki](https://github.com/rstrouse/ESPSomfy-RTS/wiki).
 
-![ESPSomfy-RTS features vs the original](images/espsomfy-features-vs-original.png)
+---
 
-### Web UI (v3.4.5)
-
-Home (shades / rooms / scenes), Settings hub, and Mesh → Repeaters (fleet status and update):
-
-| Home | Settings | Mesh repeaters |
-|---|---|---|
-| ![Home](images/ui-home-shades.png) | ![Settings](images/ui-settings-hub.png) | ![Mesh](images/ui-mesh-repeaters.png) |
-
-**Repository:** [github.com/jcvsite/ESPSomfy-RTS](https://github.com/jcvsite/ESPSomfy-RTS)
-
-## Why this fork
-
-A single radio often cannot cover a large property. This firmware treats one ESP as the **Router** (shades, HA, MQTT, UI) and optional **Repeaters** as extra transmitters on the LAN, with room-level Auto routing to the best radio. Capacity, an on-device **RF command queue** (room Open/Close/My and scenes for all motors), and schedules are sized for villa-scale installs rather than a few living-room blinds.
-
-It also merges useful fixes from upstream PRs and other forks. See [Credits](#credits).
-
-## What changed vs the original
+## What you get
 
 | | Original (v2.4.7) | This fork |
 |---|---|---|
-| Shades / rooms | 32 / 16 (30 / 14 usable IDs) | **48 / 24** (all usable) |
-| Radios | One ESP32 + CC1101 | **Router + up to 4 Repeaters** on the LAN |
-| Which radio transmits | The one ESP | Every radio until a paired remote is heard; then the loudest (failover if offline) |
-| Repeater config | — | Router pushes timezone, NTP, and login; Repeater names are edited on the Router |
-| Mesh fleet OTA | — | Router pushes firmware / LittleFS to online Repeaters |
-| Scenes | — | Up to **8** named scenes (capture room positions, run from Home) |
-| Schedules | — | Up to **8** NTP time-of-day rules (room or scene) |
-| Room / scene actions | Per-shade or truncated batches | On-device **RF command queue** — Open / My / Close all and scenes enqueue every motor (up to **48**), no 12/24 cut-off |
-| Web UI | Multi-language desktop UI | Redesigned Settings/Home; **English** shipped (extra languages possible via locales) |
-| Position scale | Motor-native | **100% open / 0% closed** (matches Home Assistant) |
-| Invert / calibrate | Limited | Invert % synced to the ESP; travel times; calibrate without moving (HA too) |
-| Stop mid-travel | My / 80-bit Stop (unreliable on many curtains) | Classic My, 3 frames, ignore self-TX echo |
-| Linked remotes | 7 per shade | **11** per shade |
-| RF switches | — | Learn / TX 433 MHz ON/OFF remotes |
-| Update / flash map | Separate bins; stock partition table | **New 4 MB OTA map** (1.75 MB × 2 app, 448 KB LittleFS). First install = **USB only**; no web/Manual Update from original or other forks. Later updates: `.espsomfy` on this fork only |
-| Home Assistant | Basic open / stop / close | Matching [ESPSomfy-RTS-HA](https://github.com/jcvsite/ESPSomfy-RTS-HA) |
+| Shades / rooms | 32 / 16 | **48 / 24** |
+| Radios | One ESP32 | **Router + up to 4 Repeaters** |
+| Room / scene TX | Truncated batches | On-device **RF queue** (all motors) |
+| Scenes / schedules | — | Up to **8** each |
+| RF switches | — | Learn / TX 433 MHz ON/OFF |
+| Web UI | Classic multi-language | Redesigned Settings/Home (**English**) |
+| Position scale | Motor-native | **100% open / 0% closed** (HA-aligned) |
+| First install | Separate bins | **USB onboard image**; later updates `.espsomfy` |
 
-Unchanged: ESP32 + CC1101 hardware, Somfy pairing, MQTT topics, and the original wiki for wiring and first setup.
+Unchanged: ESP32 + CC1101, Somfy pairing, MQTT topics, original wiki for wiring.
 
-### Mesh
-One **Router** holds shades, Home Assistant, MQTT, and the web UI. **Repeaters** are extra radios only — no shade list, HA, or MQTT.
+### Architecture & features
 
-First-run wizard: Router or Repeater. Pair Repeaters with the Router login password. A device that already has shades becomes Router automatically.
+![Architecture vs original](images/espsomfy-architecture-vs-original.png)
 
-On Mesh → Repeaters, each room can be **Auto (best radio)** or locked to This unit / a Slave. Auto picks the strongest radio that heard a **linked** remote (≥ −85 dBm). Link the physical Somfy remote on the shade for Auto and Activity naming.
+![Features vs original](images/espsomfy-features-vs-original.png)
 
-### Motor control and RF queue
-Stop actually stops. Reverse while moving sends My first. HA/UI My while the motor is running sends `stop`, not favorite. Self-transmitted Up/Down echoes are ignored so estimated position does not jump to 0% / 100%.
+### Web UI
 
-Room Open / My / Close and scenes do not fire motors one-at-a-time from the browser. The Router holds an **on-device RF queue** and transmits each shade in turn (up to 48), so a large villa is not truncated at the old 12/24 limits. Home Assistant room covers and `apply_scene` use the same queue.
+| Home | Settings | Mesh |
+|---|---|---|
+| ![Home](images/ui-home-shades.png) | ![Settings](images/ui-settings-hub.png) | ![Mesh](images/ui-mesh-repeaters.png) |
 
-## Install / update
+---
 
-### Coming from original or another fork (USB required)
+## Flash a new device
 
-This fork’s partition table is **not** compatible with the original or other forks. Web Manual Update and GitHub OTA **cannot** rewrite the table at `0x8000`.
+Use this for a **blank chip** or a board that has never run this fork.
 
-- Do **not** upload a v3 `.espsomfy` (or firmware/LittleFS bins) onto a device still running rstrouse, xkain, or any other non-v3 map.
-- Do **not** expect those firmwares’ web updaters to install this release.
-- First migration: **Backup** (`.backup` export) → USB flash (partition + firmware + filesystem) → **Restore / import** the same backup. Shades, rooms, groups, and remote addresses come back. After that, web updates work for **this fork’s** packages only.
+### You need
 
-### USB migration (once)
+- ESP32 + CC1101 (same hardware as the original project)
+- USB cable that carries data
+- Chrome or Edge (for ESPHome Web)
+- Latest **onboard** zip from [Releases](https://github.com/jcvsite/ESPSomfy-RTS/releases)  
+  Example: `SomfyController.onboard.esp32-v3.4.5.bin.zip`
 
-v3 moves the flash map (firmware slots 1.75 MB, LittleFS 448 KB).
+> Pick the zip that matches your chip: `esp32`, `esp32c3`, `esp32s3_4mb`, `esp32s3_8mb`, …
 
-1. Web UI → **Backup** (save the `.backup` file).
-2. USB, **no full erase** (keeps Wi‑Fi in NVS):
+### Steps (recommended — no PlatformIO)
+
+1. **Download** the versioned onboard zip for your board from Releases.
+2. **Unzip** it. Inside you need `SomfyController.onboard.bin`  
+   (bootloader + partition table + firmware + filesystem).
+3. Open **[ESPHome Web](https://web.esphome.io/)** → connect the board over USB.
+4. Choose **Install** → **Prepare for first use** is fine on a blank chip → then install your **custom** `.bin`.  
+   Do **not** install ESPHome’s own firmware.
+5. When it reboots, join the board’s Wi‑Fi hotspot (or wait until it joins yours if already configured) and open the web UI — usually `http://espsomfyrts.local` or the SoftAP address shown on serial.
+6. Complete the **first-run wizard**: **Router** (main hub) or **Repeater** (extra radio only).
+
+### After first boot
+
+1. Set Wi‑Fi / Ethernet under **Settings → Network**.
+2. Pair motors in **Settings → Devices** (same flow as the [original wiki](https://github.com/rstrouse/ESPSomfy-RTS/wiki/Configuring-the-Software)).
+3. Optional: add [Home Assistant](https://github.com/jcvsite/ESPSomfy-RTS-HA), MQTT, or Mesh Repeaters.
+
+### PlatformIO alternative (developers)
 
 ```bash
 python -m platformio run -t upload -e esp32dev
 python -m platformio run -t buildfs -t uploadfs -e esp32dev
 ```
 
-3. The device should rejoin the same LAN. **Restore** the backup.
-4. Repeaters need the same USB pair. After that, web `.espsomfy` works again **within this fork**.
+---
 
-#### USB flash with ESPHome Web (no PlatformIO)
+## Migrate from another firmware
 
-Chrome or Edge only (Web Serial). Good for migration and blank/factory chips.
+Coming from **rstrouse**, **xkain**, or any non‑v3 build? Web OTA **cannot** rewrite the partition table. Do this **once per board** (Router and each Repeater).
 
-1. On the **current** firmware: **Backup** and save the `.backup` file (skip on a blank chip).
-2. Download the **versioned** onboard zip for your chip from this fork’s GitHub **Releases**, e.g. `SomfyController.onboard.esp32-v3.4.5.bin.zip` (tag in the filename).
-3. Unzip it — you need the inner `SomfyController.onboard.bin` (bootloader + partitions + firmware + LittleFS).
-4. Open [ESPHome Web](https://web.esphome.io/), connect the board over USB, and install that **custom** `.bin` (do **not** install ESPHome firmware). Prefer **no full erase** if offered, so Wi‑Fi credentials in NVS can survive.
-5. After reboot, open the device web UI and **Restore** the `.backup`.
+### Steps
 
-Use the matching asset for your board (`esp32`, `esp32c3`, `esp32s3_4mb`, …) and the release tag you want. Do **not** flash `.espsomfy` here — that is only for Manual Update after you are already on this fork’s v3 partition map. The onboard image rewrites LittleFS; shades come back only via Restore.
+1. On the **old** firmware: **Backup** and save the `.backup` file.
+2. Flash the **same onboard zip** as a new device ([ESPHome Web](#steps-recommended--no-platformio) or PlatformIO above).  
+   Prefer **no full erase** so Wi‑Fi in NVS can survive.
+3. Open the new web UI → **Restore** that `.backup`.
+4. Confirm radio GPIOs under **Settings → Radio** if needed.
 
-### Later updates on this fork (web)
+Shades, rooms, groups, and remote addresses come back from the backup. You do **not** need to re-pair every motor if Restore succeeds.
 
-Already on this fork’s v3 map? Use Manual Update:
+### Do not
+
+- Upload a v3 `.espsomfy` onto a device still on another fork’s map.
+- Expect the old web updater to install this release.
+
+---
+
+## Update on this fork (Wi‑Fi)
+
+Already running **this fork’s v3** map? Use the web UI — no USB.
+
+1. Download `SomfyController.esp32-vX.Y.Z.espsomfy` from [Releases](https://github.com/jcvsite/ESPSomfy-RTS/releases)  
+   (or build locally — see below).
+2. Open the device → **Settings → System → Firmware → Manual Update**.
+3. Choose the `.espsomfy` file and confirm.
+
+**Backup first** when the UI asks — shade data lives on LittleFS.
+
+GitHub OTA (check for updates) is **off** by default. Enable it only if you want the device to pull from this repo’s releases.
+
+### Build the package yourself
 
 ```bash
 python -m platformio run -e esp32dev
 python -m platformio run -t buildfs -e esp32dev
 ```
 
-Web UI → Firmware → **Manual Update** → Local file:
+Upload:
 
 ```text
 .pio/build/esp32dev/SomfyController.esp32.espsomfy
 ```
 
-Default `esp32dev` builds with the **latest** SmartRC-CC1101 Driver Lib (**3.0.2**). Fallback build with **2.5.7** if needed:
+CC1101 driver **3.0.2** is default. Fallback **2.5.7**:
 
 ```bash
 python -m platformio run -e esp32dev-cc1101v257
 python -m platformio run -t buildfs -e esp32dev-cc1101v257
 ```
 
-Prefer the web updater for the application part — USB `uploadfs` wipes LittleFS (shades). Download **Backup** first if you must flash the filesystem over USB.
+### Release file names
 
-GitHub releases publish **versioned** assets only (e.g. `SomfyController.onboard.esp32-v3.4.5.bin.zip`, `…-v3.4.5.espsomfy`, `…-v3.4.5.bin`). Unversioned/market-style names are not published — this fork is not compatible with those firmwares.
+| File | When to use |
+|---|---|
+| `SomfyController.onboard.esp32-vX.Y.Z.bin.zip` | **USB first install / migration** |
+| `SomfyController.esp32-vX.Y.Z.espsomfy` | **Wi‑Fi Manual Update** (already on this fork) |
+| `SomfyController.ino.esp32-vX.Y.Z.bin` | Firmware-only (advanced) |
+| `SomfyController.littlefs-vX.Y.Z.bin` | Filesystem-only (advanced; wipes shade files if flashed over USB) |
 
-Flash both Router and Repeaters with the same `.espsomfy` when mesh behavior changes.
+Only **versioned** assets are published. Do not use unversioned / other-fork packages.
 
-GitHub OTA is **off** by default. Enable it only after you publish releases on this fork. Cross-fork / original ↔ this map remains USB-only.
+Flash **Router and Repeaters** with the same release when mesh behavior changes.
+
+---
+
+## Mesh (Router + Repeaters)
+
+- **Router** — shades, Home Assistant, MQTT, web UI, scenes, schedules.
+- **Repeater** — extra RF only (no shade list on its Home screen).
+
+Pair Repeaters with the Router login. On the Router: **Settings → Mesh → Repeaters** — set each room to **Auto** (best radio) or lock it to a unit. Link a physical Somfy remote on each shade so Auto / Activity can learn RSSI.
+
+---
 
 ## Home Assistant
 
-Use the matching integration: [jcvsite/ESPSomfy-RTS-HA](https://github.com/jcvsite/ESPSomfy-RTS-HA) **v2.6.1** (invert, travel times, calibrate, cover pictures, FixedCode, room covers, scenes, reliable Stop). That component includes **multi-language** Home Assistant translations (e.g. en / de / es / fr).
+Use **[jcvsite/ESPSomfy-RTS-HA](https://github.com/jcvsite/ESPSomfy-RTS-HA) v2.6.1+** with this firmware (not the stock HA component if you want invert, calibrate, room covers, scenes, FixedCode).
 
-### Alexa / voice
+### Voice
 
-- **With Home Assistant:** enable HA Cloud Alexa (or a manual Alexa Smart Home skill), expose `cover.*` entities, then discover devices in the Alexa app. Covers appear as Interior/Exterior Blind by shade type. Prefer this path when you use HA.
-- **Without Home Assistant:** on the **Router**, Network → **Alexa** → enable the Hue bridge, then toggle shades in the list (max 24). Alexa discovers dimmable **lights** — say “turn on Kitchen Window” / set brightness. Re-discover after changing the list. Do not use Hue and HA Alexa for the same shades.
+- **With HA:** HA Cloud Alexa (or a skill) → expose covers.
+- **Without HA:** Router → **Network → Alexa** (Hue bridge, max 24 shades). Don’t mix Hue bridge and HA Alexa on the same motors.
 
-The original [rstrouse/ESPSomfy-RTS-HA](https://github.com/rstrouse/ESPSomfy-RTS-HA) still does basic open / stop / close only.
+---
 
-## Hardware and pairing
+## Hardware & pairing
 
-Unchanged from the original:
+Same as upstream:
 
 - [Simple hardware guide](https://github.com/rstrouse/ESPSomfy-RTS/wiki/Simple-ESPSomfy-RTS-device)
-- [Installing the firmware](https://github.com/rstrouse/ESPSomfy-RTS/wiki/Installing-the-Firmware)
+- [Installing the firmware](https://github.com/rstrouse/ESPSomfy-RTS/wiki/Installing-the-Firmware) *(use this fork’s USB / `.espsomfy` steps above instead of their bins)*
 - [Configuring the software](https://github.com/rstrouse/ESPSomfy-RTS/wiki/Configuring-the-Software)
 - [Integrations](https://github.com/rstrouse/ESPSomfy-RTS/wiki/Integrations)
 
-IO Home Control is not native. GPIO / dissected-remote options are in the original wiki.
+IO Home Control is not native.
 
-## Restore / import backups
+---
 
-USB reflash changes the partition map; it does **not** require re-pairing every motor from scratch if you import a backup.
+## Backup & restore
 
-- **From this fork or rstrouse v2.4.x:** Web UI → **Backup** before flashing, then **Restore** after. Shades, groups, rooms, and remote addresses load from the `.backup` file.
-- After import, confirm radio GPIOs on the Radio tab if the board selector does not match your wiring.
-- Prefer Backup/Restore over relying on LittleFS surviving `uploadfs` (USB filesystem flash wipes shade files).
+- Always **Backup** before USB filesystem flash or major upgrades.
+- USB `uploadfs` / onboard image **replaces LittleFS** — Restore brings shades back.
+- Backups from this fork and rstrouse v2.4.x restore on this firmware.
+
+---
 
 ## Credits
 
 Built on [rstrouse/ESPSomfy-RTS](https://github.com/rstrouse/ESPSomfy-RTS). Earlier UI/PlatformIO work from [xkain/ESPSomfy-RTS](https://github.com/xkain/ESPSomfy-RTS).
 
-Matching Home Assistant integration: [jcvsite/ESPSomfy-RTS-HA](https://github.com/jcvsite/ESPSomfy-RTS-HA).
+- Firmware: [jcvsite/ESPSomfy-RTS](https://github.com/jcvsite/ESPSomfy-RTS)
+- Home Assistant: [jcvsite/ESPSomfy-RTS-HA](https://github.com/jcvsite/ESPSomfy-RTS-HA)
